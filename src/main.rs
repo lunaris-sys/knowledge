@@ -14,8 +14,8 @@ mod writer;
 use anyhow::Result;
 use tracing::info;
 
-const CONSUMER_SOCKET: &str = "/run/lunaris/event-bus-consumer.sock";
-const DB_PATH: &str = "/var/lib/lunaris/knowledge/events.db";
+const DEFAULT_CONSUMER_SOCKET: &str = "/run/lunaris/event-bus-consumer.sock";
+const DEFAULT_DB_PATH: &str = "/var/lib/lunaris/knowledge/events.db";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -28,10 +28,15 @@ async fn main() -> Result<()> {
 
     info!("starting knowledge daemon");
 
-    let pool = db::open(DB_PATH).await?;
-    info!(path = DB_PATH, "database ready");
+    let consumer_socket = std::env::var("LUNARIS_CONSUMER_SOCKET")
+        .unwrap_or_else(|_| DEFAULT_CONSUMER_SOCKET.to_string());
+    let db_path = std::env::var("LUNARIS_DB_PATH")
+        .unwrap_or_else(|_| DEFAULT_DB_PATH.to_string());
 
-    writer::run(CONSUMER_SOCKET, pool).await?;
+    let pool = db::open(&db_path).await?;
+    info!(path = db_path, "database ready");
+
+    writer::run(&consumer_socket, pool).await?;
 
     Ok(())
 }

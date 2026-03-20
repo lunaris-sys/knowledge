@@ -620,6 +620,7 @@ dependencies = [
  "prost",
  "prost-build",
  "sqlx",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
