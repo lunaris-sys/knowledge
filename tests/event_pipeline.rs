@@ -119,6 +119,8 @@ async fn event_lands_in_sqlite() {
         Command::new(binary_path("knowledge"))
             .env("LUNARIS_CONSUMER_SOCKET", consumer_socket_str)
             .env("LUNARIS_DB_PATH", db_path_str)
+            .env("LUNARIS_GRAPH_PATH", tmp.path().join("graph").to_str().unwrap())
+            .env("LUNARIS_DAEMON_SOCKET", tmp.path().join("daemon.sock").to_str().unwrap())
             .env("RUST_LOG", "error")
             .spawn()
             .expect("failed to start knowledge"),
