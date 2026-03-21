@@ -68,4 +68,4 @@ cargo bench --bench graph_scale   # performance benchmarks
 
 ## Part of
 
-[Lunaris](https://github.com/lunaris-sys) — a Linux desktop OS built around a system-wide knowledge graph.
+[Lunaris](https://github.com/lunaris-sys): a Linux desktop OS built around a system-wide knowledge graph.
