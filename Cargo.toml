@@ -18,6 +18,12 @@ uuid = { version = "1", features = ["v7"] }
 lbug = "0.15.2"
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3"
 [build-dependencies]
 prost-build = "0.13"
+
+[[bench]]
+name = "graph_scale"
+harness = false
+
