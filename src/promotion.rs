@@ -1,5 +1,6 @@
 use crate::graph::GraphHandle;
 use crate::proto::{FileOpenedPayload, WindowFocusedPayload};
+use crate::utils::escape_cypher;
 use anyhow::Result;
 use prost::Message;
 use sqlx::SqlitePool;
@@ -13,15 +14,6 @@ const PROMOTION_INTERVAL: Duration = Duration::from_secs(30);
 /// High-water mark key in a metadata table we use to track progress.
 /// The promotion pass only processes events newer than the last run.
 const HWM_KEY: &str = "promotion_hwm";
-
-/// Escape a string for safe interpolation into a Cypher single-quoted literal.
-///
-/// Cypher uses `'...'` for string literals with `\` as the escape character.
-/// This function escapes backslashes and single quotes so that user-supplied
-/// values (file paths, app IDs, window titles) cannot break out of the string.
-fn escape_cypher(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('\'', "\\'")
-}
 
 /// Run the promotion pass forever, waking every `PROMOTION_INTERVAL`.
 ///
@@ -61,7 +53,7 @@ async fn ensure_metadata_table(pool: &SqlitePool) -> Result<()> {
 
 /// Read the current high-water mark timestamp from the metadata table.
 /// Returns 0 if no HWM has been recorded yet (first run).
-async fn read_hwm(pool: &SqlitePool) -> Result<i64> {
+pub(crate) async fn read_hwm(pool: &SqlitePool) -> Result<i64> {
     let row: Option<(String,)> =
         sqlx::query_as("SELECT value FROM metadata WHERE key = ?")
             .bind(HWM_KEY)

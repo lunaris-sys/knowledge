@@ -196,6 +196,39 @@ fn create_schema(conn: &Connection) -> Result<()> {
     )
     .map_err(|e| anyhow!("create DERIVED_FROM rel: {e}"))?;
 
+    // Retention policy: summary nodes for compacted old data.
+    conn.query(
+        "CREATE NODE TABLE IF NOT EXISTS Summary(
+            id                   STRING,
+            type                 STRING,
+            app_id               STRING,
+            access_count         INT64,
+            primary_application  STRING,
+            active_period_start  INT64,
+            active_period_end    INT64,
+            PRIMARY KEY(id)
+        )",
+    )
+    .map_err(|e| anyhow!("create Summary table: {e}"))?;
+
+    conn.query(
+        "CREATE REL TABLE IF NOT EXISTS SUMMARIZES(FROM Summary TO App)",
+    )
+    .map_err(|e| anyhow!("create SUMMARIZES rel: {e}"))?;
+
+    // Pin marker: separate node table to mark nodes as permanent.
+    // Using a separate table avoids ALTER TABLE on existing node tables.
+    conn.query(
+        "CREATE NODE TABLE IF NOT EXISTS PinnedMarker(
+            id         STRING,
+            node_id    STRING,
+            node_type  STRING,
+            pinned_at  INT64,
+            PRIMARY KEY(id)
+        )",
+    )
+    .map_err(|e| anyhow!("create PinnedMarker table: {e}"))?;
+
     debug!("schema created");
     Ok(())
 }

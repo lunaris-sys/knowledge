@@ -2,6 +2,7 @@
 // Used by benchmarks and integration tests.
 
 pub mod db;
+pub mod utils;
 
 pub mod proto {
     #![allow(dead_code)]

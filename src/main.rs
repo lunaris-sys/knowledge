@@ -12,6 +12,8 @@ mod daemon;
 mod db;
 mod graph;
 mod promotion;
+mod retention;
+mod utils;
 mod writer;
 
 use anyhow::Result;
@@ -50,16 +52,18 @@ async fn main() -> Result<()> {
     let graph = graph::spawn(&graph_path)?;
     info!(path = graph_path, "ladybug query store ready");
 
-    // Run all three components concurrently:
+    // Run all four components concurrently:
     // - writer: consumes events from the Event Bus into SQLite
     // - promotion: moves events from SQLite into Ladybug periodically
+    // - retention: purges old events and compacts old graph nodes daily
     // - daemon: accepts Cypher queries over a Unix socket
     //
-    // tokio::try_join! runs all three concurrently and returns when
+    // tokio::try_join! runs all four concurrently and returns when
     // the first one exits (with either Ok or Err).
     tokio::try_join!(
         writer::run(&consumer_socket, pool.clone()),
-        promotion::run(pool, graph.clone()),
+        promotion::run(pool.clone(), graph.clone()),
+        retention::run(pool, graph.clone()),
         daemon::listen(&daemon_socket, graph),
     )?;
 
