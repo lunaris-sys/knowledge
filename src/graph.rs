@@ -1,8 +1,44 @@
 use anyhow::{anyhow, Result};
-use lbug::{Connection, Database, SystemConfig};
+use lbug::{Connection, Database, SystemConfig, Value};
 use std::sync::mpsc;
 use std::thread;
 use tracing::{debug, info};
+
+/// A cell value extracted from a Ladybug QueryResult, safe to send
+/// across threads.
+#[derive(Debug, Clone)]
+pub enum CellValue {
+    Null,
+    String(String),
+    Int64(i64),
+    Bool(bool),
+    Float(f64),
+}
+
+impl CellValue {
+    /// Extract a string reference, returning empty string for non-string values.
+    pub fn as_str(&self) -> &str {
+        match self {
+            CellValue::String(s) => s,
+            _ => "",
+        }
+    }
+
+    /// Extract an i64, returning 0 for non-integer values.
+    pub fn as_i64(&self) -> i64 {
+        match self {
+            CellValue::Int64(i) => *i,
+            _ => 0,
+        }
+    }
+}
+
+/// Structured query result with column names and typed rows.
+#[derive(Debug, Clone)]
+pub struct RowSet {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<CellValue>>,
+}
 
 /// A message sent to the Ladybug thread.
 /// Each variant carries a one-shot channel to send the result back.
@@ -16,6 +52,11 @@ pub enum GraphRequest {
     Query {
         cypher: String,
         reply: tokio::sync::oneshot::Sender<Result<String>>,
+    },
+    /// Execute a Cypher query and return structured rows.
+    QueryRows {
+        cypher: String,
+        reply: tokio::sync::oneshot::Sender<Result<RowSet>>,
     },
     /// Shut down the Ladybug thread cleanly.
     Shutdown,
@@ -50,6 +91,37 @@ impl GraphHandle {
     /// Internally this is just a query that happens to be a write.
     pub async fn write(&self, cypher: String) -> Result<String> {
         self.query(cypher).await
+    }
+
+    /// Execute a Cypher query and return structured rows (async).
+    pub async fn query_rows(&self, cypher: String) -> Result<RowSet> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(GraphRequest::QueryRows {
+                cypher,
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow!("ladybug thread has stopped"))?;
+        reply_rx
+            .await
+            .map_err(|_| anyhow!("ladybug thread dropped reply sender"))?
+    }
+
+    /// Execute a Cypher query and return structured rows (blocking).
+    ///
+    /// Intended for use on non-tokio threads (e.g. the FUSE thread).
+    /// Must NOT be called from within a tokio async context.
+    pub fn query_rows_sync(&self, cypher: String) -> Result<RowSet> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.sender
+            .send(GraphRequest::QueryRows {
+                cypher,
+                reply: reply_tx,
+            })
+            .map_err(|_| anyhow!("ladybug thread has stopped"))?;
+        reply_rx
+            .blocking_recv()
+            .map_err(|_| anyhow!("ladybug thread dropped reply sender"))?
     }
 }
 
@@ -106,6 +178,19 @@ fn ladybug_thread(path: &str, rx: mpsc::Receiver<GraphRequest>) -> Result<()> {
                 // If the caller dropped the oneshot receiver we just ignore the error.
                 reply.send(result).ok();
             }
+            GraphRequest::QueryRows { cypher, reply } => {
+                debug!(cypher = %cypher, "executing cypher (rows)");
+                let result = conn.query(&cypher).map_err(|e| anyhow!("{e}"));
+                let row_set = result.map(|mut qr| {
+                    let columns = qr.get_column_names();
+                    let rows = qr
+                        .by_ref()
+                        .map(|row| row.into_iter().map(value_to_cell).collect())
+                        .collect();
+                    RowSet { columns, rows }
+                });
+                reply.send(row_set).ok();
+            }
             GraphRequest::Shutdown => {
                 info!("ladybug thread shutting down");
                 break;
@@ -114,6 +199,26 @@ fn ladybug_thread(path: &str, rx: mpsc::Receiver<GraphRequest>) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Convert a Ladybug Value to a thread-safe CellValue.
+fn value_to_cell(v: Value) -> CellValue {
+    match v {
+        Value::String(s) => CellValue::String(s),
+        Value::Int64(i) => CellValue::Int64(i),
+        Value::Int32(i) => CellValue::Int64(i64::from(i)),
+        Value::Int16(i) => CellValue::Int64(i64::from(i)),
+        Value::Int8(i) => CellValue::Int64(i64::from(i)),
+        Value::UInt64(i) => CellValue::Int64(i as i64),
+        Value::UInt32(i) => CellValue::Int64(i64::from(i)),
+        Value::UInt16(i) => CellValue::Int64(i64::from(i)),
+        Value::UInt8(i) => CellValue::Int64(i64::from(i)),
+        Value::Bool(b) => CellValue::Bool(b),
+        Value::Double(f) => CellValue::Float(f),
+        Value::Float(f) => CellValue::Float(f64::from(f)),
+        Value::Null(_) => CellValue::Null,
+        other => CellValue::String(other.to_string()),
+    }
 }
 
 /// Create the Knowledge Graph node and relationship tables.

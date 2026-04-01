@@ -10,6 +10,7 @@ mod proto {
 
 mod daemon;
 mod db;
+mod fuse;
 mod graph;
 mod promotion;
 mod retention;
@@ -23,6 +24,7 @@ const DEFAULT_CONSUMER_SOCKET: &str = "/run/lunaris/event-bus-consumer.sock";
 const DEFAULT_DB_PATH: &str = "/var/lib/lunaris/knowledge/events.db";
 const DEFAULT_GRAPH_PATH: &str = "/var/lib/lunaris/knowledge/graph";
 const DEFAULT_DAEMON_SOCKET: &str = "/run/lunaris/knowledge.sock";
+const DEFAULT_TIMELINE_MOUNT: &str = ".timeline";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -43,6 +45,10 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| DEFAULT_GRAPH_PATH.to_string());
     let daemon_socket = std::env::var("LUNARIS_DAEMON_SOCKET")
         .unwrap_or_else(|_| DEFAULT_DAEMON_SOCKET.to_string());
+    let timeline_mount = std::env::var("LUNARIS_TIMELINE_MOUNT").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        format!("{home}/{DEFAULT_TIMELINE_MOUNT}")
+    });
 
     // Open SQLite write store
     let pool = db::open(&db_path).await?;
@@ -51,6 +57,16 @@ async fn main() -> Result<()> {
     // Spawn the dedicated Ladybug thread
     let graph = graph::spawn(&graph_path)?;
     info!(path = graph_path, "ladybug query store ready");
+
+    // FUSE runs on a dedicated OS thread (blocking mount).
+    let fuse_graph = graph.clone();
+    std::thread::Builder::new()
+        .name("fuse-timeline".into())
+        .spawn(move || {
+            if let Err(e) = fuse::mount(&timeline_mount, fuse_graph) {
+                tracing::error!("FUSE mount failed: {e}");
+            }
+        })?;
 
     // Run all four components concurrently:
     // - writer: consumes events from the Event Bus into SQLite

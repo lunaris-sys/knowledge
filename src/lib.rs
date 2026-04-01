@@ -2,6 +2,8 @@
 // Used by benchmarks and integration tests.
 
 pub mod db;
+pub mod fuse;
+pub mod graph;
 pub mod utils;
 
 pub mod proto {

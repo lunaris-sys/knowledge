@@ -16,6 +16,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v7"] }
 lbug = "0.15.2"
+fuser = "0.17"
+time = { version = "0.3", features = ["formatting", "macros"] }
+libc = "0.2"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
