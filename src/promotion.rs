@@ -1,5 +1,7 @@
 use crate::graph::GraphHandle;
+use crate::proto::{FileOpenedPayload, WindowFocusedPayload};
 use anyhow::Result;
+use prost::Message;
 use sqlx::SqlitePool;
 use std::time::Duration;
 use tokio::time;
@@ -11,6 +13,15 @@ const PROMOTION_INTERVAL: Duration = Duration::from_secs(30);
 /// High-water mark key in a metadata table we use to track progress.
 /// The promotion pass only processes events newer than the last run.
 const HWM_KEY: &str = "promotion_hwm";
+
+/// Escape a string for safe interpolation into a Cypher single-quoted literal.
+///
+/// Cypher uses `'...'` for string literals with `\` as the escape character.
+/// This function escapes backslashes and single quotes so that user-supplied
+/// values (file paths, app IDs, window titles) cannot break out of the string.
+fn escape_cypher(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\'', "\\'")
+}
 
 /// Run the promotion pass forever, waking every `PROMOTION_INTERVAL`.
 ///
@@ -77,18 +88,19 @@ async fn write_hwm(pool: &SqlitePool, hwm: i64) -> Result<()> {
 /// Run a single promotion pass.
 ///
 /// Reads all events from SQLite with timestamp > high-water mark,
-/// promotes them to Ladybug, and updates the HWM.
+/// promotes them to Ladybug, and updates the HWM only if every event
+/// in the batch was promoted successfully.
 ///
 /// Promotion criteria for Phase 1A:
 /// - All `file.opened` events become `File` and `App` nodes with an `ACCESSED_BY` edge.
-/// - All `window.focused` events become `App` and `Session` nodes with an `ACTIVE_IN` edge.
+/// - All `window.focused` events become `App`, `Session`, and `Event` nodes with `ACTIVE_IN` edge.
 /// - Other event types are stored in SQLite but not yet promoted (Phase 2).
 async fn run_pass(pool: &SqlitePool, graph: &GraphHandle) -> Result<()> {
     let hwm = read_hwm(pool).await?;
 
-    // Fetch unprocessed events ordered by timestamp.
-    let rows: Vec<(String, String, i64, String, i64, String)> = sqlx::query_as(
-        "SELECT id, type, timestamp, source, pid, session_id
+    // Fetch unprocessed events ordered by timestamp, including the payload.
+    let rows: Vec<(String, String, i64, String, i64, String, Vec<u8>)> = sqlx::query_as(
+        "SELECT id, type, timestamp, source, pid, session_id, payload
          FROM events
          WHERE timestamp > ?
          ORDER BY timestamp ASC
@@ -105,16 +117,17 @@ async fn run_pass(pool: &SqlitePool, graph: &GraphHandle) -> Result<()> {
 
     info!(count = rows.len(), "promoting events to ladybug");
 
-    let mut new_hwm = hwm;
+    let mut all_ok = true;
+    let mut last_timestamp = hwm;
 
-    for (id, event_type, timestamp, source, pid, session_id) in &rows {
+    for (id, event_type, timestamp, source, pid, session_id, payload) in &rows {
         let result = match event_type.as_str() {
             "file.opened" => {
-                promote_file_opened(graph, id, timestamp, source, &pid.to_string(), session_id)
+                promote_file_opened(graph, id, timestamp, source, pid, session_id, payload)
                     .await
             }
             "window.focused" => {
-                promote_window_focused(graph, id, timestamp, session_id).await
+                promote_window_focused(graph, id, timestamp, session_id, payload).await
             }
             _ => {
                 // Not yet promoted; will be handled in a later phase.
@@ -125,86 +138,145 @@ async fn run_pass(pool: &SqlitePool, graph: &GraphHandle) -> Result<()> {
 
         if let Err(e) = result {
             error!(event_id = %id, event_type, "promotion failed: {e}");
-            // Continue with other events rather than aborting the whole pass.
+            all_ok = false;
+            // Stop advancing HWM: we do not skip failed events.
+            break;
         }
 
-        new_hwm = *timestamp;
+        last_timestamp = *timestamp;
     }
 
-    write_hwm(pool, new_hwm).await?;
-    info!(hwm = new_hwm, promoted = rows.len(), "promotion pass complete");
+    // Only advance the HWM if every event in the batch succeeded.
+    // On failure, the next pass will retry from the same position.
+    if all_ok && last_timestamp > hwm {
+        write_hwm(pool, last_timestamp).await?;
+        info!(hwm = last_timestamp, promoted = rows.len(), "promotion pass complete");
+    } else if !all_ok {
+        // Advance to the last successfully promoted event so we do not
+        // re-process events that already succeeded.
+        if last_timestamp > hwm {
+            write_hwm(pool, last_timestamp).await?;
+        }
+        info!(hwm = last_timestamp, "promotion pass incomplete, will retry failed events");
+    }
+
     Ok(())
 }
 
 /// Promote a `file.opened` event.
 ///
-/// Creates or merges a `File` node and an `App` node, then creates an
-/// `ACCESSED_BY` edge between them. Uses `MERGE` so repeated events on
-/// the same file do not create duplicate nodes.
+/// Deserializes the payload to obtain the file path and app ID, then
+/// creates or merges a `File` node (keyed by path) and an `App` node,
+/// with an `ACCESSED_BY` edge between them.
 async fn promote_file_opened(
     graph: &GraphHandle,
     event_id: &str,
     timestamp: &i64,
     source: &str,
-    pid: &str,
+    pid: &i64,
     _session_id: &str,
+    payload: &[u8],
 ) -> Result<()> {
-    // For Phase 1A we use the source as the app_id since we do not yet have
-    // full app identity resolution from eBPF. This will be refined in Phase 2
-    // when the eBPF Normalizer resolves PIDs to app IDs.
-    let app_id = format!("{source}:{pid}");
+    let file_payload = FileOpenedPayload::decode(payload)?;
 
-    // MERGE creates the node if it does not exist, otherwise matches it.
-    // This is Cypher's equivalent of INSERT OR IGNORE combined with a lookup.
+    // Use the file path as the node ID so repeated opens of the same file
+    // merge into a single node rather than creating duplicates.
+    let path = if file_payload.path.is_empty() {
+        // Fallback: eBPF events from Phase 1A may not have a resolved path yet.
+        format!("unknown:{event_id}")
+    } else {
+        file_payload.path.clone()
+    };
+
+    // Prefer the app_id from the payload; fall back to source:pid.
+    let app_id = if file_payload.app_id.is_empty() {
+        format!("{source}:{pid}")
+    } else {
+        file_payload.app_id.clone()
+    };
+
+    let path_esc = escape_cypher(&path);
+    let app_id_esc = escape_cypher(&app_id);
+    let source_esc = escape_cypher(source);
+
     graph
         .write(format!(
-            "MERGE (a:App {{id: '{app_id}'}}) SET a.name = '{source}'"
+            "MERGE (a:App {{id: '{app_id_esc}'}}) SET a.name = '{source_esc}'"
         ))
         .await?;
 
     graph
         .write(format!(
-            "MERGE (f:File {{id: '{event_id}'}})
-             SET f.last_accessed = {timestamp}, f.app_id = '{app_id}'"
+            "MERGE (f:File {{id: '{path_esc}'}})
+             SET f.path = '{path_esc}', f.last_accessed = {timestamp}, f.app_id = '{app_id_esc}'"
         ))
         .await?;
 
     graph
         .write(format!(
-            "MATCH (f:File {{id: '{event_id}'}}), (a:App {{id: '{app_id}'}})
+            "MATCH (f:File {{id: '{path_esc}'}}), (a:App {{id: '{app_id_esc}'}})
              MERGE (f)-[:ACCESSED_BY]->(a)"
         ))
         .await?;
 
-    debug!(event_id, "promoted file.opened");
+    debug!(event_id, path = %file_payload.path, "promoted file.opened");
     Ok(())
 }
 
 /// Promote a `window.focused` event.
 ///
-/// Creates or merges a `Session` node and an `App` node, then creates an
-/// `ACTIVE_IN` edge between them.
+/// Deserializes the payload to obtain the app ID and window title, then
+/// creates or merges `App`, `Session`, and `Event` nodes with an
+/// `ACTIVE_IN` edge from App to Session.
 async fn promote_window_focused(
     graph: &GraphHandle,
     event_id: &str,
     timestamp: &i64,
     session_id: &str,
+    payload: &[u8],
 ) -> Result<()> {
+    let win_payload = WindowFocusedPayload::decode(payload)?;
+
+    let app_id = if win_payload.app_id.is_empty() {
+        "unknown".to_string()
+    } else {
+        win_payload.app_id.clone()
+    };
+
+    let app_id_esc = escape_cypher(&app_id);
+    let session_id_esc = escape_cypher(session_id);
+    let event_id_esc = escape_cypher(event_id);
+    let title_esc = escape_cypher(&win_payload.window_title);
+
     graph
         .write(format!(
-            "MERGE (s:Session {{id: '{session_id}'}})
+            "MERGE (a:App {{id: '{app_id_esc}'}}) SET a.name = '{app_id_esc}'"
+        ))
+        .await?;
+
+    graph
+        .write(format!(
+            "MERGE (s:Session {{id: '{session_id_esc}'}})
              SET s.started_at = {timestamp}"
         ))
         .await?;
 
     graph
         .write(format!(
-            "MERGE (e:Event {{id: '{event_id}'}})
+            "MERGE (e:Event {{id: '{event_id_esc}'}})
              SET e.type = 'window.focused', e.timestamp = {timestamp},
-                 e.source = 'wayland'"
+                 e.source = 'wayland', e.title = '{title_esc}'"
         ))
         .await?;
 
-    debug!(event_id, "promoted window.focused");
+    // Create the ACTIVE_IN edge: the focused app is active in this session.
+    graph
+        .write(format!(
+            "MATCH (a:App {{id: '{app_id_esc}'}}), (s:Session {{id: '{session_id_esc}'}})
+             MERGE (a)-[:ACTIVE_IN]->(s)"
+        ))
+        .await?;
+
+    debug!(event_id, app_id = %app_id, "promoted window.focused");
     Ok(())
 }
