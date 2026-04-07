@@ -16,6 +16,7 @@ mod fuse;
 mod graph;
 mod identity;
 mod lifecycle;
+mod migration;
 mod permission;
 mod promotion;
 mod quota;

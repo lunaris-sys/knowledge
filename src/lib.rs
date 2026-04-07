@@ -7,6 +7,7 @@ pub mod fuse;
 pub mod graph;
 pub mod identity;
 pub mod lifecycle;
+pub mod migration;
 pub mod permission;
 pub mod quota;
 pub mod schema;
