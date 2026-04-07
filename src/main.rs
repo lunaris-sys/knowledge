@@ -18,6 +18,7 @@ mod identity;
 mod lifecycle;
 mod permission;
 mod promotion;
+mod quota;
 mod retention;
 mod schema;
 mod token;

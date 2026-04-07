@@ -8,6 +8,7 @@ pub mod graph;
 pub mod identity;
 pub mod lifecycle;
 pub mod permission;
+pub mod quota;
 pub mod schema;
 pub mod token;
 pub mod token_cache;
