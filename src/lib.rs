@@ -6,6 +6,7 @@ pub mod db;
 pub mod fuse;
 pub mod graph;
 pub mod identity;
+pub mod lifecycle;
 pub mod permission;
 pub mod schema;
 pub mod token;

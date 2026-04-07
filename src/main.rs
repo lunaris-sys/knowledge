@@ -15,6 +15,7 @@ mod events;
 mod fuse;
 mod graph;
 mod identity;
+mod lifecycle;
 mod permission;
 mod promotion;
 mod retention;
