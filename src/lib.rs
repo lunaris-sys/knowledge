@@ -7,6 +7,7 @@ pub mod fuse;
 pub mod graph;
 pub mod identity;
 pub mod permission;
+pub mod schema;
 pub mod token;
 pub mod token_cache;
 pub mod utils;

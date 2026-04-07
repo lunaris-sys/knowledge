@@ -18,6 +18,7 @@ mod identity;
 mod permission;
 mod promotion;
 mod retention;
+mod schema;
 mod token;
 mod token_cache;
 mod utils;
