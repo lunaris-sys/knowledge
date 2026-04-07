@@ -22,6 +22,7 @@ mod schema;
 mod token;
 mod token_cache;
 mod utils;
+mod write;
 mod writer;
 
 use anyhow::Result;

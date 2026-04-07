@@ -21,6 +21,7 @@ sha2 = "0.10"
 getrandom = "0.2"
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 serde_bytes = "0.11"
 chrono = { version = "0.4", features = ["serde"] }
 fuser = "0.17"

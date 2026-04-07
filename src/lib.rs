@@ -11,6 +11,7 @@ pub mod schema;
 pub mod token;
 pub mod token_cache;
 pub mod utils;
+pub mod write;
 
 pub mod proto {
     #![allow(dead_code)]
