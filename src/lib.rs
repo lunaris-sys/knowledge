@@ -1,9 +1,14 @@
 // Library interface for knowledge crate.
 // Used by benchmarks and integration tests.
 
+pub mod auth;
 pub mod db;
 pub mod fuse;
 pub mod graph;
+pub mod identity;
+pub mod permission;
+pub mod token;
+pub mod token_cache;
 pub mod utils;
 
 pub mod proto {

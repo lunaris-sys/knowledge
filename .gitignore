@@ -1,3 +1,4 @@
 /target
 *.bak
 target/debug/knowledge
+CLAUDE.md

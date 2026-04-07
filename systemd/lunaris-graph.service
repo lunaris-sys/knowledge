@@ -1,0 +1,26 @@
+[Unit]
+Description=Lunaris Graph Daemon
+Documentation=https://github.com/lunaris-sys/knowledge
+After=lunaris-event-bus.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/lunaris-graph-daemon
+Restart=on-failure
+RestartSec=1
+
+# Paths
+Environment=LUNARIS_DAEMON_SOCKET=/run/user/%U/lunaris/graph.sock
+Environment=LUNARIS_GRAPH_DB=%h/.local/share/lunaris/graph
+Environment=LUNARIS_DB_PATH=%h/.local/share/lunaris/events.db
+Environment=RUST_LOG=info
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/lunaris
+ReadWritePaths=/run/user/%U/lunaris
+
+[Install]
+WantedBy=default.target

@@ -14,11 +14,21 @@ prost = "0.13"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1", features = ["v7"] }
+uuid = { version = "1", features = ["v7", "serde"] }
 lbug = "0.15.2"
+hmac = "0.12"
+sha2 = "0.10"
+getrandom = "0.2"
+rmp-serde = "1"
+serde = { version = "1", features = ["derive"] }
+serde_bytes = "0.11"
+chrono = { version = "0.4", features = ["serde"] }
 fuser = "0.17"
 time = { version = "0.3", features = ["formatting", "macros"] }
 libc = "0.2"
+dirs = "5"
+thiserror = "2"
+toml = "0.8"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

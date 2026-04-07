@@ -185,6 +185,7 @@ mod tests {
             pid: 1,
             session_id: "session-test".to_string(),
             payload: vec![],
+            uid: 0,
         }
     }
 

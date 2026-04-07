@@ -8,12 +8,18 @@ mod proto {
     include!(concat!(env!("OUT_DIR"), "/lunaris.eventbus.rs"));
 }
 
+mod auth;
 mod daemon;
 mod db;
+mod events;
 mod fuse;
 mod graph;
+mod identity;
+mod permission;
 mod promotion;
 mod retention;
+mod token;
+mod token_cache;
 mod utils;
 mod writer;
 
