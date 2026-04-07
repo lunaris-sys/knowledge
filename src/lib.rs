@@ -11,6 +11,7 @@ pub mod migration;
 pub mod permission;
 pub mod quota;
 pub mod schema;
+pub mod shared;
 pub mod token;
 pub mod token_cache;
 pub mod utils;

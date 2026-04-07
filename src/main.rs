@@ -22,6 +22,7 @@ mod promotion;
 mod quota;
 mod retention;
 mod schema;
+mod shared;
 mod token;
 mod token_cache;
 mod utils;

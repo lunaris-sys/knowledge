@@ -41,7 +41,7 @@ fn default_schema_version() -> u32 {
 }
 
 /// Definition of a single entity type.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct EntityDefinition {
     /// Entity schema version for migrations.
     #[serde(default = "default_entity_version")]
@@ -65,7 +65,7 @@ fn default_entity_version() -> u32 {
 }
 
 /// Definition of a single field on an entity.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 pub struct FieldDefinition {
     /// Field type.
     #[serde(rename = "type")]
@@ -96,9 +96,10 @@ pub struct FieldDefinition {
 }
 
 /// Supported field types.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FieldType {
+    #[default]
     String,
     Text,
     Int,
