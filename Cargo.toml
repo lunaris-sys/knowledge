@@ -30,6 +30,7 @@ libc = "0.2"
 dirs = "5"
 thiserror = "2"
 toml = "0.8"
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

@@ -9,6 +9,7 @@ mod proto {
 }
 
 mod auth;
+mod backup;
 mod daemon;
 mod db;
 mod events;

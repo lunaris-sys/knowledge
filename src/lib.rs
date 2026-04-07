@@ -2,6 +2,7 @@
 // Used by benchmarks and integration tests.
 
 pub mod auth;
+pub mod backup;
 pub mod db;
 pub mod fuse;
 pub mod graph;
