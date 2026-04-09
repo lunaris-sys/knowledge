@@ -19,6 +19,7 @@ mod identity;
 mod lifecycle;
 mod migration;
 mod permission;
+mod project;
 mod promotion;
 mod quota;
 mod retention;
@@ -80,6 +81,14 @@ async fn main() -> Result<()> {
                 tracing::error!("FUSE mount failed: {e}");
             }
         })?;
+
+    // Project watcher: scans configured directories and watches for changes.
+    let project_graph = graph.clone();
+    tokio::spawn(async move {
+        if let Err(e) = project::watcher::run(project_graph).await {
+            tracing::error!("project watcher error: {e}");
+        }
+    });
 
     // Run all four components concurrently:
     // - writer: consumes events from the Event Bus into SQLite

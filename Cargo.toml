@@ -31,6 +31,9 @@ dirs = "5"
 thiserror = "2"
 toml = "0.8"
 zip = { version = "2", default-features = false, features = ["deflate"] }
+notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
+shellexpand = "3"
+regex = "1"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
