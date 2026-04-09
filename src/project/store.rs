@@ -452,6 +452,32 @@ impl ProjectStore {
             .await?;
         Ok(())
     }
+
+    /// Count distinct files linked to a project that were accessed by an
+    /// app active in the given session.
+    pub async fn count_session_files(
+        &self,
+        session_id: &str,
+        project_id: Uuid,
+    ) -> Result<usize> {
+        let pid = escape_cypher(&project_id.to_string());
+        let sid = escape_cypher(session_id);
+        let rs = self
+            .graph
+            .query_rows(format!(
+                "MATCH (f:File)-[:FILE_PART_OF]->(p:Project {{id: '{pid}'}})
+                 MATCH (f)-[:ACCESSED_BY]->(a:App)-[:ACTIVE_IN]->(s:Session {{id: '{sid}'}})
+                 RETURN count(DISTINCT f) AS cnt"
+            ))
+            .await?;
+        let count = rs
+            .rows
+            .first()
+            .and_then(|r| r.first())
+            .map(|v| v.as_i64())
+            .unwrap_or(0);
+        Ok(count as usize)
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────
