@@ -159,6 +159,7 @@ mod tests {
             session_id: "s".into(),
             payload: vec![],
             uid: 0,
+            project_id: String::new(),
         };
         match parse_event(&event) {
             Some(GraphEvent::PermissionChanged { app_id }) => {
@@ -181,6 +182,7 @@ mod tests {
             session_id: "s".into(),
             payload,
             uid: 0,
+            project_id: String::new(),
         };
         match parse_event(&event) {
             Some(GraphEvent::PermissionChanged { app_id }) => {
@@ -201,6 +203,7 @@ mod tests {
             session_id: "s".into(),
             payload: vec![],
             uid: 0,
+            project_id: String::new(),
         };
         assert!(matches!(parse_event(&event), Some(GraphEvent::AiLevelChanged)));
     }
@@ -217,6 +220,7 @@ mod tests {
             session_id: "s".into(),
             payload,
             uid: 0,
+            project_id: String::new(),
         };
         match parse_event(&event) {
             Some(GraphEvent::SchemaRegistered { app_id }) => {
@@ -237,6 +241,7 @@ mod tests {
             session_id: "s".into(),
             payload: vec![],
             uid: 1000,
+            project_id: String::new(),
         };
         assert!(parse_event(&event).is_none());
     }

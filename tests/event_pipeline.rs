@@ -139,6 +139,7 @@ async fn event_lands_in_sqlite() {
         session_id: "session-integration-test".to_string(),
         payload: vec![],
         uid: 1000,
+        project_id: String::new(),
     };
 
     send_event(producer_socket_str, &event);
