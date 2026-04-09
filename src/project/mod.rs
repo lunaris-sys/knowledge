@@ -1,6 +1,7 @@
 /// Project system: detection, storage, PART_OF edges, and filesystem watching.
 
 pub mod config;
+pub mod emitter;
 mod parser;
 pub mod signals;
 mod store;

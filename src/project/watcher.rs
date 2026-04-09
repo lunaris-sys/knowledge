@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::graph::GraphHandle;
+use crate::project::emitter::ProjectEmitter;
 use crate::project::signals::{SignalDetector, SignalType};
 use crate::project::watch_config::WatchConfig;
 use crate::project::{Project, ProjectParser, ProjectStatus, ProjectStore};
@@ -20,12 +21,17 @@ use crate::project::{Project, ProjectParser, ProjectStatus, ProjectStore};
 pub struct ProjectWatcher {
     config: WatchConfig,
     store: Arc<ProjectStore>,
+    emitter: ProjectEmitter,
 }
 
 impl ProjectWatcher {
     /// Create a new watcher.
     pub fn new(config: WatchConfig, store: Arc<ProjectStore>) -> Self {
-        Self { config, store }
+        Self {
+            config,
+            store,
+            emitter: ProjectEmitter::new(),
+        }
     }
 
     /// Scan all configured directories once and register projects.
@@ -115,6 +121,13 @@ impl ProjectWatcher {
         };
 
         self.store.create(&project).await?;
+        self.emitter.emit_created(
+            &project.id.to_string(),
+            &project.name,
+            &project.root_path,
+            project.inferred,
+            project.confidence,
+        );
         info!(
             "detected project: {} at {} (confidence {}%)",
             project.name, project.root_path, project.confidence
@@ -173,6 +186,7 @@ impl ProjectWatcher {
         }
 
         self.store.update(&project).await?;
+        self.emitter.emit_updated(&project.id.to_string(), &project.name);
         info!("updated project: {}", project.name);
         Ok(())
     }
@@ -191,10 +205,16 @@ impl ProjectWatcher {
             project.confidence = signal.confidence;
             project.name = signal.project_name;
             self.store.update(&project).await?;
+            self.emitter.emit_updated(&project.id.to_string(), &project.name);
             info!("demoted project to inferred: {}", project.name);
         } else {
             // No signals left -- archive.
             self.store.archive(project.id).await?;
+            self.emitter.emit_archived(
+                &project.id.to_string(),
+                &project.name,
+                &project.root_path,
+            );
             info!("archived project: {}", project.name);
         }
         Ok(())

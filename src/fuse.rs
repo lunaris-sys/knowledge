@@ -30,6 +30,21 @@ enum VPath {
     File { target: String, name: String },
 }
 
+/// Sanitize a project name for use as a FUSE directory name.
+fn sanitize_dirname(name: &str) -> String {
+    let s: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    if s.is_empty() { "unnamed".to_string() } else { s }
+}
+
 pub struct TimelineFs {
     graph: GraphHandle,
     inodes: Mutex<HashMap<u64, VPath>>,
@@ -190,14 +205,37 @@ impl TimelineFs {
         self.query_string_column(cypher)
     }
 
-    fn query_all_apps(&self) -> Vec<String> {
-        self.query_string_column("MATCH (a:App) RETURN a.id".into())
+    /// List active projects as (sanitized_name, project_id).
+    fn query_active_projects(&self) -> Vec<(String, String)> {
+        let cypher =
+            "MATCH (p:Project) WHERE p.status = 'active' RETURN p.id, p.name ORDER BY p.name"
+                .to_string();
+        match self.graph.query_rows_sync(cypher) {
+            Ok(rs) => rs
+                .rows
+                .iter()
+                .filter_map(|row| {
+                    let id = row.first()?.as_str();
+                    let name = row.get(1)?.as_str();
+                    if name.is_empty() {
+                        None
+                    } else {
+                        Some((sanitize_dirname(name), id.to_string()))
+                    }
+                })
+                .collect(),
+            Err(e) => {
+                warn!("fuse: project list query failed: {e}");
+                Vec::new()
+            }
+        }
     }
 
-    fn query_files_for_app(&self, app_id: &str) -> Vec<String> {
-        let app_esc = escape_cypher(app_id);
+    /// List file paths belonging to a project by its graph ID.
+    fn query_files_for_project(&self, project_id: &str) -> Vec<String> {
+        let pid_esc = escape_cypher(project_id);
         let cypher = format!(
-            "MATCH (f:File)-[:ACCESSED_BY]->(a:App {{id: '{app_esc}'}}) RETURN f.path"
+            "MATCH (f:File)-[:FILE_PART_OF]->(p:Project {{id: '{pid_esc}'}}) RETURN f.path"
         );
         self.query_string_column(cypher)
     }
@@ -292,17 +330,17 @@ impl TimelineFs {
                 self.add_file_entries(ino, &paths, &mut entries);
             }
             VPath::Projects => {
-                for app_id in self.query_all_apps() {
-                    let app_ino = self.register(
-                        &format!("project:{app_id}"),
-                        VPath::ProjectApp(app_id.clone()),
+                for (dir_name, project_id) in self.query_active_projects() {
+                    let p_ino = self.register(
+                        &format!("project:{project_id}"),
+                        VPath::ProjectApp(project_id),
                     );
-                    entries.push((app_ino, FileType::Directory, app_id));
+                    entries.push((p_ino, FileType::Directory, dir_name));
                 }
             }
-            VPath::ProjectApp(ref app_id) => {
-                let app_id = app_id.clone();
-                let paths = self.query_files_for_app(&app_id);
+            VPath::ProjectApp(ref project_id) => {
+                let project_id = project_id.clone();
+                let paths = self.query_files_for_project(&project_id);
                 self.add_file_entries(ino, &paths, &mut entries);
             }
             VPath::Last7Days => {
@@ -365,11 +403,19 @@ impl Filesystem for TimelineFs {
                 reply.entry(&TTL, &Self::dir_attr(ino), Generation(0));
             }
             VPath::Projects => {
-                let ino = self.register(
-                    &format!("project:{name_str}"),
-                    VPath::ProjectApp(name_str.to_string()),
-                );
-                reply.entry(&TTL, &Self::dir_attr(ino), Generation(0));
+                // Find the project_id for this sanitized directory name.
+                let projects = self.query_active_projects();
+                if let Some((_dir_name, project_id)) =
+                    projects.iter().find(|(n, _)| n == name_str)
+                {
+                    let ino = self.register(
+                        &format!("project:{project_id}"),
+                        VPath::ProjectApp(project_id.clone()),
+                    );
+                    reply.entry(&TTL, &Self::dir_attr(ino), Generation(0));
+                } else {
+                    reply.error(Errno::ENOENT);
+                }
             }
             VPath::DateApp(_, _) | VPath::ProjectApp(_) | VPath::Last7Days => {
                 let key = format!("file:{}:{name_str}", parent.0);
@@ -454,4 +500,41 @@ pub fn mount(path: &str, graph: GraphHandle) -> Result<()> {
     tracing::info!(path, "mounting timeline FUSE filesystem");
     fuser::mount2(fs, path, &config)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_simple() {
+        assert_eq!(sanitize_dirname("my-project"), "my-project");
+        assert_eq!(sanitize_dirname("my_project"), "my_project");
+        assert_eq!(sanitize_dirname("v1.2.3"), "v1.2.3");
+    }
+
+    #[test]
+    fn sanitize_spaces() {
+        assert_eq!(sanitize_dirname("My Project"), "My-Project");
+    }
+
+    #[test]
+    fn sanitize_special_chars() {
+        assert_eq!(sanitize_dirname("project/name"), "project-name");
+        assert_eq!(sanitize_dirname("project:name"), "project-name");
+        assert_eq!(sanitize_dirname("a@b#c"), "a-b-c");
+    }
+
+    #[test]
+    fn sanitize_empty() {
+        assert_eq!(sanitize_dirname(""), "unnamed");
+    }
+
+    #[test]
+    fn sanitize_unicode() {
+        // Non-ASCII replaced with dashes.
+        let s = sanitize_dirname("prüfung");
+        assert!(s.contains('-'));
+        assert!(s.starts_with("pr"));
+    }
 }
