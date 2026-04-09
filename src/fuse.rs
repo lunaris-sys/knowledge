@@ -5,7 +5,7 @@ use fuser::{
     Errno, FileAttr, FileHandle, FileType, Filesystem, Generation, INodeNo, MountOption, ReplyAttr,
     ReplyData, ReplyDirectory, ReplyEntry, Request,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::Mutex;
@@ -26,8 +26,42 @@ enum VPath {
     Last7Days,
     Date(String),
     DateApp(String, String),
+    /// Intermediate directory under /projects/ (e.g. "lunaris-sys").
+    /// Stores the virtual prefix path relative to /projects/.
+    ProjectDir(String),
+    /// Leaf project directory. Stores the graph project ID.
     ProjectApp(String),
     File { target: String, name: String },
+}
+
+/// Find the longest common directory prefix of a list of absolute paths.
+fn longest_common_dir(paths: &[&str]) -> String {
+    if paths.is_empty() {
+        return String::new();
+    }
+    let first = paths[0];
+    let mut prefix_len = first.len();
+    for p in &paths[1..] {
+        let common = first
+            .bytes()
+            .zip(p.bytes())
+            .take_while(|(a, b)| a == b)
+            .count();
+        prefix_len = prefix_len.min(common);
+    }
+    // Truncate to last '/' boundary.
+    let prefix = &first[..prefix_len];
+    match prefix.rfind('/') {
+        Some(pos) => first[..pos].to_string(),
+        None => String::new(),
+    }
+}
+
+/// Return the last N path components joined by '/'.
+fn last_n_components(path: &str, n: usize) -> String {
+    let components: Vec<&str> = path.trim_end_matches('/').rsplit('/').take(n).collect();
+    let mut result: Vec<&str> = components.into_iter().rev().collect();
+    result.join("/")
 }
 
 /// Sanitize a project name for use as a FUSE directory name.
@@ -205,10 +239,10 @@ impl TimelineFs {
         self.query_string_column(cypher)
     }
 
-    /// List active projects as (sanitized_name, project_id).
-    fn query_active_projects(&self) -> Vec<(String, String)> {
+    /// List active projects as (id, name, root_path).
+    fn query_active_projects_full(&self) -> Vec<(String, String, String)> {
         let cypher =
-            "MATCH (p:Project) WHERE p.status = 'active' RETURN p.id, p.name ORDER BY p.name"
+            "MATCH (p:Project) WHERE p.status = 'active' RETURN p.id, p.name, p.root_path ORDER BY p.root_path"
                 .to_string();
         match self.graph.query_rows_sync(cypher) {
             Ok(rs) => rs
@@ -217,10 +251,11 @@ impl TimelineFs {
                 .filter_map(|row| {
                     let id = row.first()?.as_str();
                     let name = row.get(1)?.as_str();
-                    if name.is_empty() {
+                    let root = row.get(2)?.as_str();
+                    if name.is_empty() || root.is_empty() {
                         None
                     } else {
-                        Some((sanitize_dirname(name), id.to_string()))
+                        Some((id.to_string(), name.to_string(), root.to_string()))
                     }
                 })
                 .collect(),
@@ -229,6 +264,81 @@ impl TimelineFs {
                 Vec::new()
             }
         }
+    }
+
+    /// Compute relative paths for projects under /projects/.
+    ///
+    /// Finds the common ancestor of all root_paths and strips it,
+    /// producing paths like `lunaris-sys/desktop-shell`.
+    /// Projects not sharing a common prefix keep their directory name.
+    fn project_relative_paths(&self) -> Vec<(String, String, String)> {
+        let projects = self.query_active_projects_full();
+        if projects.is_empty() {
+            return Vec::new();
+        }
+
+        // Find the longest common directory prefix of all root_paths.
+        let paths: Vec<&str> = projects.iter().map(|(_, _, r)| r.as_str()).collect();
+        let common = longest_common_dir(&paths);
+
+        projects
+            .into_iter()
+            .map(|(id, _name, root)| {
+                let rel = if common.is_empty() {
+                    // No common prefix: use last two components
+                    last_n_components(&root, 2)
+                } else if let Some(stripped) = root.strip_prefix(&common) {
+                    let stripped = stripped.trim_start_matches('/');
+                    if stripped.is_empty() {
+                        Path::new(&root)
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .unwrap_or("unknown")
+                            .to_string()
+                    } else {
+                        stripped.to_string()
+                    }
+                } else {
+                    last_n_components(&root, 2)
+                };
+                (id, rel, root)
+            })
+            .collect()
+    }
+
+    /// List direct children (dirs or project leaves) at a virtual prefix.
+    fn projects_children_at(
+        &self,
+        prefix: &str,
+    ) -> (Vec<String>, Vec<(String, String)>) {
+        let all = self.project_relative_paths();
+        let mut subdirs: HashSet<String> = HashSet::new();
+        let mut leaves: Vec<(String, String)> = Vec::new(); // (dir_name, project_id)
+
+        for (id, rel, _root) in &all {
+            let child = if prefix.is_empty() {
+                rel.as_str()
+            } else if let Some(rest) = rel.strip_prefix(prefix) {
+                rest.trim_start_matches('/')
+            } else {
+                continue;
+            };
+            if child.is_empty() {
+                continue;
+            }
+            if let Some(slash_pos) = child.find('/') {
+                // Intermediate directory.
+                subdirs.insert(child[..slash_pos].to_string());
+            } else {
+                // Leaf project.
+                leaves.push((child.to_string(), id.clone()));
+            }
+        }
+
+        let mut dirs: Vec<String> = subdirs.into_iter().collect();
+        dirs.sort();
+        leaves.sort_by(|a, b| a.0.cmp(&b.0));
+        (dirs, leaves)
     }
 
     /// List file paths belonging to a project by its graph ID.
@@ -330,12 +440,38 @@ impl TimelineFs {
                 self.add_file_entries(ino, &paths, &mut entries);
             }
             VPath::Projects => {
-                for (dir_name, project_id) in self.query_active_projects() {
+                let (subdirs, leaves) = self.projects_children_at("");
+                for dir in subdirs {
+                    let d_ino = self.register(
+                        &format!("pdir:{dir}"),
+                        VPath::ProjectDir(dir.clone()),
+                    );
+                    entries.push((d_ino, FileType::Directory, dir));
+                }
+                for (name, project_id) in leaves {
                     let p_ino = self.register(
                         &format!("project:{project_id}"),
                         VPath::ProjectApp(project_id),
                     );
-                    entries.push((p_ino, FileType::Directory, dir_name));
+                    entries.push((p_ino, FileType::Directory, name));
+                }
+            }
+            VPath::ProjectDir(ref prefix) => {
+                let (subdirs, leaves) = self.projects_children_at(prefix);
+                for dir in subdirs {
+                    let full = format!("{prefix}/{dir}");
+                    let d_ino = self.register(
+                        &format!("pdir:{full}"),
+                        VPath::ProjectDir(full),
+                    );
+                    entries.push((d_ino, FileType::Directory, dir));
+                }
+                for (name, project_id) in leaves {
+                    let p_ino = self.register(
+                        &format!("project:{project_id}"),
+                        VPath::ProjectApp(project_id),
+                    );
+                    entries.push((p_ino, FileType::Directory, name));
                 }
             }
             VPath::ProjectApp(ref project_id) => {
@@ -403,18 +539,48 @@ impl Filesystem for TimelineFs {
                 reply.entry(&TTL, &Self::dir_attr(ino), Generation(0));
             }
             VPath::Projects => {
-                // Find the project_id for this sanitized directory name.
-                let projects = self.query_active_projects();
-                if let Some((_dir_name, project_id)) =
-                    projects.iter().find(|(n, _)| n == name_str)
-                {
+                let (subdirs, leaves) = self.projects_children_at("");
+                if subdirs.iter().any(|d| d == name_str) {
                     let ino = self.register(
-                        &format!("project:{project_id}"),
-                        VPath::ProjectApp(project_id.clone()),
+                        &format!("pdir:{name_str}"),
+                        VPath::ProjectDir(name_str.to_string()),
+                    );
+                    reply.entry(&TTL, &Self::dir_attr(ino), Generation(0));
+                } else if let Some((_, pid)) = leaves.iter().find(|(n, _)| n == name_str) {
+                    let ino = self.register(
+                        &format!("project:{pid}"),
+                        VPath::ProjectApp(pid.clone()),
                     );
                     reply.entry(&TTL, &Self::dir_attr(ino), Generation(0));
                 } else {
                     reply.error(Errno::ENOENT);
+                }
+            }
+            VPath::ProjectDir(ref prefix) => {
+                let (subdirs, leaves) = self.projects_children_at(prefix);
+                if subdirs.iter().any(|d| d == name_str) {
+                    let full = format!("{prefix}/{name_str}");
+                    let ino = self.register(
+                        &format!("pdir:{full}"),
+                        VPath::ProjectDir(full),
+                    );
+                    reply.entry(&TTL, &Self::dir_attr(ino), Generation(0));
+                } else if let Some((_, pid)) = leaves.iter().find(|(n, _)| n == name_str) {
+                    let ino = self.register(
+                        &format!("project:{pid}"),
+                        VPath::ProjectApp(pid.clone()),
+                    );
+                    reply.entry(&TTL, &Self::dir_attr(ino), Generation(0));
+                } else {
+                    // Might be a file inside a project leaf -- try file lookup.
+                    let key = format!("file:{}:{name_str}", parent.0);
+                    let raw = Self::hash_key(&key);
+                    if let Some(VPath::File { ref target, .. }) = self.lookup_vpath(INodeNo(raw)) {
+                        let attr = Self::symlink_attr(INodeNo(raw), target.len() as u64);
+                        reply.entry(&TTL, &attr, Generation(0));
+                    } else {
+                        reply.error(Errno::ENOENT);
+                    }
                 }
             }
             VPath::DateApp(_, _) | VPath::ProjectApp(_) | VPath::Last7Days => {
@@ -531,9 +697,58 @@ mod tests {
 
     #[test]
     fn sanitize_unicode() {
-        // Non-ASCII replaced with dashes.
         let s = sanitize_dirname("prüfung");
         assert!(s.contains('-'));
         assert!(s.starts_with("pr"));
+    }
+
+    #[test]
+    fn common_dir_basic() {
+        let paths = vec![
+            "/home/tim/Repositories/lunaris-sys/desktop-shell",
+            "/home/tim/Repositories/lunaris-sys/knowledge",
+            "/home/tim/Repositories/lunaris-sys/compositor",
+        ];
+        assert_eq!(
+            longest_common_dir(&paths),
+            "/home/tim/Repositories/lunaris-sys"
+        );
+    }
+
+    #[test]
+    fn common_dir_mixed() {
+        let paths = vec![
+            "/home/tim/Repositories/lunaris-sys/desktop-shell",
+            "/home/tim/Repositories/podliner",
+        ];
+        assert_eq!(longest_common_dir(&paths), "/home/tim/Repositories");
+    }
+
+    #[test]
+    fn common_dir_single() {
+        let paths = vec!["/home/tim/Repositories/project-a"];
+        assert_eq!(longest_common_dir(&paths), "/home/tim/Repositories");
+    }
+
+    #[test]
+    fn common_dir_empty() {
+        let paths: Vec<&str> = vec![];
+        assert_eq!(longest_common_dir(&paths), "");
+    }
+
+    #[test]
+    fn last_n_components_2() {
+        assert_eq!(
+            last_n_components("/home/tim/Repositories/lunaris-sys/desktop-shell", 2),
+            "lunaris-sys/desktop-shell"
+        );
+    }
+
+    #[test]
+    fn last_n_components_1() {
+        assert_eq!(
+            last_n_components("/home/tim/Repositories/podliner", 1),
+            "podliner"
+        );
     }
 }
