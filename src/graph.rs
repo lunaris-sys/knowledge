@@ -301,6 +301,49 @@ fn create_schema(conn: &Connection) -> Result<()> {
     )
     .map_err(|e| anyhow!("create DERIVED_FROM rel: {e}"))?;
 
+    // Project system: project detection and file association.
+    conn.query(
+        "CREATE NODE TABLE IF NOT EXISTS Project(
+            id             STRING,
+            name           STRING,
+            description    STRING,
+            root_path      STRING,
+            accent_color   STRING,
+            icon           STRING,
+            status         STRING,
+            created_at     INT64,
+            last_accessed  INT64,
+            inferred       BOOL,
+            confidence     INT64,
+            promoted       BOOL,
+            archived_at    INT64,
+            PRIMARY KEY(id)
+        )",
+    )
+    .map_err(|e| anyhow!("create Project table: {e}"))?;
+
+    conn.query(
+        "CREATE NODE TABLE IF NOT EXISTS Directory(
+            id         STRING,
+            path       STRING,
+            name       STRING,
+            project_id STRING,
+            created_at INT64,
+            PRIMARY KEY(id)
+        )",
+    )
+    .map_err(|e| anyhow!("create Directory table: {e}"))?;
+
+    conn.query(
+        "CREATE REL TABLE IF NOT EXISTS FILE_PART_OF(FROM File TO Project)",
+    )
+    .map_err(|e| anyhow!("create FILE_PART_OF rel: {e}"))?;
+
+    conn.query(
+        "CREATE REL TABLE IF NOT EXISTS DIR_PART_OF(FROM Directory TO Project)",
+    )
+    .map_err(|e| anyhow!("create DIR_PART_OF rel: {e}"))?;
+
     // Retention policy: summary nodes for compacted old data.
     conn.query(
         "CREATE NODE TABLE IF NOT EXISTS Summary(
