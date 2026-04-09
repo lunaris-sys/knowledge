@@ -494,7 +494,6 @@ pub fn mount(path: &str, graph: GraphHandle) -> Result<()> {
     config.mount_options = vec![
         MountOption::RO,
         MountOption::FSName("lunaris-timeline".into()),
-        MountOption::AutoUnmount,
     ];
 
     tracing::info!(path, "mounting timeline FUSE filesystem");
