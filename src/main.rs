@@ -31,14 +31,58 @@ mod utils;
 mod write;
 mod writer;
 
-use anyhow::Result;
-use tracing::info;
+use anyhow::{bail, Result};
+use tracing::{info, warn};
 
 const DEFAULT_CONSUMER_SOCKET: &str = "/run/lunaris/event-bus-consumer.sock";
 const DEFAULT_DB_PATH: &str = "/var/lib/lunaris/knowledge/events.db";
 const DEFAULT_GRAPH_PATH: &str = "/var/lib/lunaris/knowledge/graph";
 const DEFAULT_DAEMON_SOCKET: &str = "/run/lunaris/knowledge.sock";
 const DEFAULT_TIMELINE_MOUNT: &str = ".timeline";
+
+/// Pick the daemon socket path with a graceful fallback for non-root
+/// runs. The hardcoded `/run/lunaris/` default requires write access
+/// we don't have outside privileged launchers; if nothing is pinned
+/// via `LUNARIS_DAEMON_SOCKET` and XDG_RUNTIME_DIR is available, use
+/// that. The daemon itself thus starts cleanly in a normal dev
+/// session even if the launcher script forgets to set the env var.
+fn pick_daemon_socket() -> String {
+    if let Ok(p) = std::env::var("LUNARIS_DAEMON_SOCKET") {
+        return p;
+    }
+    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR") {
+        let path = format!("{xdg}/lunaris/knowledge.sock");
+        if let Some(parent) = std::path::Path::new(&path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        return path;
+    }
+    DEFAULT_DAEMON_SOCKET.to_string()
+}
+
+/// Check whether `path` is currently a mount point. Reads
+/// `/proc/self/mountinfo` directly so we don't depend on the
+/// `mountpoint(1)` binary being installed. Returns `false` on any
+/// error — the caller then tries to mount normally (which will fail
+/// with a clear error if it actually IS a mount).
+fn is_mountpoint(path: &str) -> bool {
+    let Ok(content) = std::fs::read_to_string("/proc/self/mountinfo") else {
+        return false;
+    };
+    // mountinfo layout per proc(5):
+    //   id parent major:minor root mount-point mount-options ... - fstype source super-opts
+    // Index 4 (0-based) is the mount point. Space-separated tokens;
+    // paths with spaces are octal-escaped but we match literal so
+    // that's fine for our `~/.timeline`.
+    for line in content.lines() {
+        if let Some(target) = line.split_whitespace().nth(4) {
+            if target == path {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -57,12 +101,12 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| DEFAULT_DB_PATH.to_string());
     let graph_path = std::env::var("LUNARIS_GRAPH_PATH")
         .unwrap_or_else(|_| DEFAULT_GRAPH_PATH.to_string());
-    let daemon_socket = std::env::var("LUNARIS_DAEMON_SOCKET")
-        .unwrap_or_else(|_| DEFAULT_DAEMON_SOCKET.to_string());
+    let daemon_socket = pick_daemon_socket();
     let timeline_mount = std::env::var("LUNARIS_TIMELINE_MOUNT").unwrap_or_else(|_| {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
         format!("{home}/{DEFAULT_TIMELINE_MOUNT}")
     });
+    info!(%daemon_socket, "daemon socket path resolved");
 
     // Open SQLite write store
     let pool = db::open(&db_path).await?;
@@ -73,11 +117,31 @@ async fn main() -> Result<()> {
     info!(path = graph_path, "ladybug query store ready");
 
     // FUSE runs on a dedicated OS thread (blocking mount).
+    //
+    // Before attempting to mount, check if `timeline_mount` is already
+    // a (possibly stale) mount point. If a previous daemon was
+    // SIGKILL'd without its FUSE exit handler firing, the kernel
+    // keeps the mount registered while the userspace process is gone
+    // — calling `fuse::mount` on that path then returns `File exists
+    // (os error 17)`. Skip the mount-attempt entirely in that case
+    // and point the operator at the launcher script which handles
+    // cleanup.
     let fuse_graph = graph.clone();
+    let fuse_mount_path = timeline_mount.clone();
     std::thread::Builder::new()
         .name("fuse-timeline".into())
         .spawn(move || {
-            if let Err(e) = fuse::mount(&timeline_mount, fuse_graph) {
+            if is_mountpoint(&fuse_mount_path) {
+                warn!(
+                    path = %fuse_mount_path,
+                    "FUSE: path already mounted — skipping remount. \
+                     Stale mount from a previous run? Fix with \
+                     `fusermount -u {fuse_mount_path}` or use \
+                     `distro/start-dev.sh` which handles this automatically",
+                );
+                return;
+            }
+            if let Err(e) = fuse::mount(&fuse_mount_path, fuse_graph) {
                 tracing::error!("FUSE mount failed: {e}");
             }
         })?;
@@ -90,20 +154,26 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Run all four components concurrently:
-    // - writer: consumes events from the Event Bus into SQLite
-    // - promotion: moves events from SQLite into Ladybug periodically
-    // - retention: purges old events and compacts old graph nodes daily
-    // - daemon: accepts Cypher queries over a Unix socket
-    //
-    // tokio::try_join! runs all four concurrently and returns when
-    // the first one exits (with either Ok or Err).
-    tokio::try_join!(
-        writer::run(&consumer_socket, pool.clone()),
-        promotion::run(pool.clone(), graph.clone()),
-        retention::run(pool, graph.clone()),
-        daemon::listen(&daemon_socket, graph),
-    )?;
-
-    Ok(())
+    // Run all four components concurrently. `tokio::select!` — not
+    // `try_join!` — so a failing task is attributed by name instead
+    // of leaving the operator with an anonymous "Error: Permission
+    // denied (os error 13)" and no way to tell which task emitted it.
+    tokio::select! {
+        r = writer::run(&consumer_socket, pool.clone()) => match r {
+            Ok(()) => bail!("writer task exited unexpectedly"),
+            Err(e) => bail!("writer ({consumer_socket}): {e}"),
+        },
+        r = promotion::run(pool.clone(), graph.clone()) => match r {
+            Ok(()) => bail!("promotion task exited unexpectedly"),
+            Err(e) => bail!("promotion: {e}"),
+        },
+        r = retention::run(pool, graph.clone()) => match r {
+            Ok(()) => bail!("retention task exited unexpectedly"),
+            Err(e) => bail!("retention: {e}"),
+        },
+        r = daemon::listen(&daemon_socket, graph) => match r {
+            Ok(()) => bail!("daemon listener exited unexpectedly"),
+            Err(e) => bail!("daemon listen ({daemon_socket}): {e}"),
+        },
+    }
 }

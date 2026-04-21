@@ -35,6 +35,13 @@ impl ProjectWatcher {
     }
 
     /// Scan all configured directories once and register projects.
+    ///
+    /// Never propagates per-directory errors up. A single unreadable
+    /// root (permission denied, unreachable network mount, FUSE with
+    /// a gone userspace process) would otherwise abort the whole scan
+    /// — and since `run()` propagates via `?`, the tokio task would
+    /// terminate. Instead, log a warning per failing root and keep
+    /// going with the others.
     pub async fn initial_scan(&self) -> anyhow::Result<usize> {
         let dirs = self.config.expanded_directories();
         if dirs.is_empty() {
@@ -45,26 +52,44 @@ impl ProjectWatcher {
         let mut count = 0;
         for dir in &dirs {
             info!("scanning {}", dir.display());
-            count += self.scan_directory(dir, 0).await?;
+            match self.scan_directory(dir, 0).await {
+                Ok(n) => count += n,
+                Err(e) => warn!("scan of {} failed: {e}", dir.display()),
+            }
         }
         info!("initial scan complete: {count} projects found");
         Ok(count)
     }
 
     /// Recursively scan a directory up to `max_depth`.
+    ///
+    /// Belt-and-braces error handling: every failure mode (read_dir
+    /// EACCES, detection I/O, per-project registration, recursion
+    /// into an unreadable subdir) is caught and logged. A single
+    /// broken subdir cannot terminate the scan of its siblings —
+    /// and since the caller already swallows our Err, the loop here
+    /// is really just defense in depth.
     async fn scan_directory(&self, dir: &Path, depth: usize) -> anyhow::Result<usize> {
         if depth > self.config.max_depth {
             return Ok(0);
         }
 
-        // Check for project signal at this level.
+        // Check for project signal at this level. If registration
+        // fails (DB busy, event-bus unreachable), log and pretend
+        // there was no signal — scan continues.
         if let Some(signal) = SignalDetector::detect(dir) {
-            let new = self.handle_detection(dir, &signal).await?;
-            // Don't recurse into detected project roots.
-            return Ok(if new { 1 } else { 0 });
+            match self.handle_detection(dir, &signal).await {
+                Ok(true) => return Ok(1),
+                Ok(false) => return Ok(0),
+                Err(e) => {
+                    warn!("failed to register project at {}: {e}", dir.display());
+                    return Ok(0);
+                }
+            }
         }
 
-        // Recurse into subdirectories.
+        // Recurse into subdirectories. `read_dir` EACCES is the most
+        // common failure and is already handled here.
         let entries = match std::fs::read_dir(dir) {
             Ok(e) => e,
             Err(e) => {
@@ -76,6 +101,9 @@ impl ProjectWatcher {
         let mut count = 0;
         for entry in entries.filter_map(|e| e.ok()) {
             let path = entry.path();
+            // `is_dir()` internally calls metadata(2) which returns
+            // false (not an error) on EACCES — the entry is skipped
+            // cleanly.
             if !path.is_dir() {
                 continue;
             }
@@ -92,7 +120,13 @@ impl ProjectWatcher {
             ) {
                 continue;
             }
-            count += Box::pin(self.scan_directory(&path, depth + 1)).await?;
+            // Per-subdir error catch: a broken subtree (stale FUSE
+            // mount, sibling dir without access) must never abort
+            // the sibling-list iteration.
+            match Box::pin(self.scan_directory(&path, depth + 1)).await {
+                Ok(n) => count += n,
+                Err(e) => debug!("subscan of {} failed: {e}", path.display()),
+            }
         }
         Ok(count)
     }
