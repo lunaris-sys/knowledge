@@ -146,6 +146,29 @@ async fn main() -> Result<()> {
             }
         })?;
 
+    // Validate-on-startup pass: any project whose root_path vanished
+    // since the last run gets pruned (inferred) or archived (explicit).
+    // Per docs/architecture/project-system.md §Validation on Access we
+    // do not poll periodically; daemon startup is one of the access
+    // points the spec calls out. Failures on individual projects do
+    // not abort the sweep — they are logged and counted.
+    {
+        let store = project::ProjectStore::new(graph.clone());
+        match store.prune_dead_projects().await {
+            Ok(stats) => info!(
+                alive = stats.alive,
+                pruned = stats.pruned,
+                archived = stats.archived,
+                errors = stats.errors,
+                "startup project validation complete"
+            ),
+            Err(e) => warn!(
+                error = %e,
+                "startup project validation failed; continuing without prune"
+            ),
+        }
+    }
+
     // Project watcher: scans configured directories and watches for changes.
     let project_graph = graph.clone();
     tokio::spawn(async move {

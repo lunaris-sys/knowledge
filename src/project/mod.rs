@@ -14,5 +14,5 @@ pub use config::{
 };
 pub use parser::{ParseError, ProjectParser};
 pub use signals::{DetectionSignal, SignalDetector, SignalType};
-pub use store::{Project, ProjectStatus, ProjectStore};
+pub use store::{Project, ProjectStatus, ProjectStore, PruneOutcome, PruneStats};
 pub use watch_config::WatchConfig;

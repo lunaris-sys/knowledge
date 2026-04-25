@@ -18,6 +18,35 @@ pub enum ProjectStatus {
     Archived,
 }
 
+/// Outcome of a prune-or-archive validation pass on a single project.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PruneOutcome {
+    /// Project root_path exists on disk; nothing changed.
+    Alive,
+    /// Project was already archived before this pass; nothing changed.
+    /// Treated as `Alive` for counting purposes — it is not a fresh
+    /// transition.
+    AlreadyArchived,
+    /// Inferred project's root_path was missing; node was DETACH-DELETEd.
+    Pruned,
+    /// Explicit project's root_path was missing; status flipped to
+    /// archived, history preserved.
+    Archived,
+}
+
+/// Counts from a bulk prune pass over all active projects.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct PruneStats {
+    /// Projects whose root_path was found on disk (kept untouched).
+    pub alive: usize,
+    /// Inferred projects whose root_path vanished (deleted from graph).
+    pub pruned: usize,
+    /// Explicit projects whose root_path vanished (archived).
+    pub archived: usize,
+    /// Per-project failures during validation (logged, sweep continues).
+    pub errors: usize,
+}
+
 impl ProjectStatus {
     /// Status as stored in the graph.
     pub fn as_str(&self) -> &'static str {
@@ -390,6 +419,67 @@ impl ProjectStore {
         }
     }
 
+    /// Validate a project's root_path on disk and prune (inferred) or
+    /// archive (explicit) when the directory is gone.
+    ///
+    /// Per `docs/architecture/project-system.md` §Validation on Access —
+    /// the spec says no periodic polling; instead we validate when a
+    /// project is touched (Waypointer list, Focus Mode activation,
+    /// daemon startup). One stat() per project is cheap.
+    ///
+    /// Inferred projects are deleted outright because their existence
+    /// was a heuristic guess — keeping a graveyard of dead inferences
+    /// would only pollute Waypointer's project list. Explicit projects
+    /// (the user wrote a `.project` file) get archived so the activity
+    /// history survives even when the working tree is moved or deleted.
+    pub async fn prune_or_archive(&self, id: Uuid) -> Result<PruneOutcome> {
+        let project = match self.get_by_id(id).await? {
+            Some(p) => p,
+            None => return Ok(PruneOutcome::Alive),
+        };
+
+        if project.status == ProjectStatus::Archived {
+            return Ok(PruneOutcome::AlreadyArchived);
+        }
+
+        if std::path::Path::new(&project.root_path).exists() {
+            return Ok(PruneOutcome::Alive);
+        }
+
+        if project.inferred {
+            self.delete(id).await?;
+            Ok(PruneOutcome::Pruned)
+        } else {
+            self.archive(id).await?;
+            Ok(PruneOutcome::Archived)
+        }
+    }
+
+    /// Walk every active project and validate-or-prune each. Used as a
+    /// startup pass so the daemon never serves a project whose root has
+    /// been gone for hours. Errors on individual projects are logged
+    /// and counted in `PruneStats.errors` but do not abort the sweep.
+    pub async fn prune_dead_projects(&self) -> Result<PruneStats> {
+        let projects = self.list_active().await?;
+        let mut stats = PruneStats::default();
+        for project in projects {
+            match self.prune_or_archive(project.id).await {
+                Ok(PruneOutcome::Alive) | Ok(PruneOutcome::AlreadyArchived) => stats.alive += 1,
+                Ok(PruneOutcome::Pruned) => stats.pruned += 1,
+                Ok(PruneOutcome::Archived) => stats.archived += 1,
+                Err(err) => {
+                    tracing::warn!(
+                        project_id = %project.id,
+                        error = %err,
+                        "prune_or_archive failed; leaving project as-is"
+                    );
+                    stats.errors += 1;
+                }
+            }
+        }
+        Ok(stats)
+    }
+
     // ── PART_OF Edge Operations ─────────────────────────────────────────
 
     /// Create a FILE_PART_OF edge from a File node to a Project node.
@@ -744,5 +834,105 @@ mod tests {
         let got = store.get_by_id(p.id).await.unwrap().unwrap();
         assert!(got.promoted);
         assert!(!got.inferred);
+    }
+
+    #[tokio::test]
+    async fn prune_or_archive_alive_root_is_noop() {
+        let (store, tmp) = setup().await;
+
+        // Use the temp dir itself as a guaranteed-existing path.
+        let live_path = tmp.path().to_string_lossy().to_string();
+        let p = Project::new_inferred("alive".into(), live_path, 90);
+        store.create(&p).await.unwrap();
+
+        let outcome = store.prune_or_archive(p.id).await.unwrap();
+        assert_eq!(outcome, PruneOutcome::Alive);
+
+        // Project must still exist in active state.
+        let got = store.get_by_id(p.id).await.unwrap().unwrap();
+        assert_eq!(got.status, ProjectStatus::Active);
+    }
+
+    #[tokio::test]
+    async fn prune_or_archive_dead_inferred_is_deleted() {
+        let (store, _tmp) = setup().await;
+
+        let p = Project::new_inferred(
+            "dead-inferred".into(),
+            "/no-such-path-1234567890/abcdef".into(),
+            85,
+        );
+        store.create(&p).await.unwrap();
+
+        let outcome = store.prune_or_archive(p.id).await.unwrap();
+        assert_eq!(outcome, PruneOutcome::Pruned);
+
+        // Node should be gone — inferred + dead means delete, not archive.
+        let got = store.get_by_id(p.id).await.unwrap();
+        assert!(got.is_none(), "inferred-dead project should be removed");
+    }
+
+    #[tokio::test]
+    async fn prune_or_archive_dead_explicit_is_archived() {
+        let (store, _tmp) = setup().await;
+
+        let p = Project::new_explicit(
+            Uuid::now_v7(),
+            "dead-explicit".into(),
+            "/no-such-path-9876543210/zyxwvu".into(),
+        );
+        store.create(&p).await.unwrap();
+
+        let outcome = store.prune_or_archive(p.id).await.unwrap();
+        assert_eq!(outcome, PruneOutcome::Archived);
+
+        // Node still present, but archived — explicit projects keep history.
+        let got = store.get_by_id(p.id).await.unwrap().unwrap();
+        assert_eq!(got.status, ProjectStatus::Archived);
+    }
+
+    #[tokio::test]
+    async fn prune_or_archive_already_archived_is_idempotent() {
+        let (store, _tmp) = setup().await;
+
+        let p = Project::new_explicit(Uuid::now_v7(), "old".into(), "/gone".into());
+        store.create(&p).await.unwrap();
+        store.archive(p.id).await.unwrap();
+
+        let outcome = store.prune_or_archive(p.id).await.unwrap();
+        assert_eq!(outcome, PruneOutcome::AlreadyArchived);
+    }
+
+    #[tokio::test]
+    async fn prune_dead_projects_aggregates_outcomes() {
+        let (store, tmp) = setup().await;
+
+        let live_path = tmp.path().to_string_lossy().to_string();
+        let alive = Project::new_inferred("alive".into(), live_path, 90);
+        let dead_inf = Project::new_inferred(
+            "dead-inferred".into(),
+            "/no-such-path-aaa/bbb".into(),
+            70,
+        );
+        let dead_exp = Project::new_explicit(
+            Uuid::now_v7(),
+            "dead-explicit".into(),
+            "/no-such-path-ccc/ddd".into(),
+        );
+        store.create(&alive).await.unwrap();
+        store.create(&dead_inf).await.unwrap();
+        store.create(&dead_exp).await.unwrap();
+
+        let stats = store.prune_dead_projects().await.unwrap();
+        assert_eq!(stats.alive, 1);
+        assert_eq!(stats.pruned, 1);
+        assert_eq!(stats.archived, 1);
+        assert_eq!(stats.errors, 0);
+
+        // Verify final graph state matches the stats.
+        assert!(store.get_by_id(alive.id).await.unwrap().is_some());
+        assert!(store.get_by_id(dead_inf.id).await.unwrap().is_none());
+        let exp_after = store.get_by_id(dead_exp.id).await.unwrap().unwrap();
+        assert_eq!(exp_after.status, ProjectStatus::Archived);
     }
 }
