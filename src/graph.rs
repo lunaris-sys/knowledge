@@ -344,6 +344,28 @@ fn create_schema(conn: &Connection) -> Result<()> {
     )
     .map_err(|e| anyhow!("create DIR_PART_OF rel: {e}"))?;
 
+    // Annotation: structured per-app metadata attached to existing graph
+    // nodes. Foundation §395. The composite identity is
+    // (target_type, target_id, namespace) — a re-set on the same
+    // triple replaces the previous data. We store target as
+    // properties rather than edges so the schema stays flat across
+    // target types (File, App, Project, Session, ...) and so the
+    // common "fetch all annotations targeting X" query is a single
+    // property scan.
+    conn.query(
+        "CREATE NODE TABLE IF NOT EXISTS Annotation(
+            id            STRING,
+            namespace     STRING,
+            target_type   STRING,
+            target_id     STRING,
+            data          STRING,
+            created_at    INT64,
+            last_modified INT64,
+            PRIMARY KEY(id)
+        )",
+    )
+    .map_err(|e| anyhow!("create Annotation table: {e}"))?;
+
     // Retention policy: summary nodes for compacted old data.
     conn.query(
         "CREATE NODE TABLE IF NOT EXISTS Summary(

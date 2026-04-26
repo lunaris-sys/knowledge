@@ -1,6 +1,9 @@
 use crate::graph::GraphHandle;
 use crate::project::ProjectStore;
-use crate::proto::{FileOpenedPayload, WindowFocusedPayload};
+use crate::proto::{
+    AnnotationClearPayload, AnnotationSetPayload, FileOpenedPayload, PresenceClearPayload,
+    PresenceSetPayload, TimelineRecordPayload, WindowFocusedPayload,
+};
 use crate::utils::escape_cypher;
 use anyhow::Result;
 use prost::Message;
@@ -8,6 +11,24 @@ use sqlx::SqlitePool;
 use std::time::Duration;
 use tokio::time;
 use tracing::{debug, error, info};
+
+/// Fixed UUIDv5 namespace for deriving deterministic annotation ids
+/// from the `(target_type, target_id, namespace)` triple. The exact
+/// bytes are arbitrary but must stay stable forever — they are baked
+/// into every Annotation node ever written. Changing this would
+/// orphan existing annotations on the next set.
+const ANNOTATION_UUID_NAMESPACE: uuid::Uuid = uuid::Uuid::from_bytes([
+    0x6e, 0xed, 0x73, 0x05, 0xc4, 0x83, 0x4d, 0x73, 0xa6, 0x86, 0xc1, 0x73, 0x4d, 0xb1, 0x29, 0x7e,
+]);
+
+/// Derive the deterministic Annotation node id from the spec's
+/// composite identity (target_type, target_id, namespace). UUIDv5 so
+/// the same triple always maps to the same id, enabling MERGE-based
+/// dedup in promotion without a separate lookup query.
+pub(crate) fn annotation_id(target_type: &str, target_id: &str, namespace: &str) -> uuid::Uuid {
+    let key = format!("{target_type}\x1f{target_id}\x1f{namespace}");
+    uuid::Uuid::new_v5(&ANNOTATION_UUID_NAMESPACE, key.as_bytes())
+}
 
 /// Number of distinct files opened in one session before an inferred
 /// project gets promoted (visible in Waypointer / Focus Mode).
@@ -147,6 +168,19 @@ async fn run_pass(pool: &SqlitePool, graph: &GraphHandle, project_store: &Projec
             "window.focused" => {
                 promote_window_focused(graph, id, timestamp, session_id, payload).await
             }
+            "app.presence.set" => {
+                promote_presence_set(graph, id, timestamp, payload).await
+            }
+            "app.presence.clear" => {
+                promote_presence_clear(graph, id, timestamp, payload).await
+            }
+            "app.timeline.record" => {
+                promote_timeline_record(graph, id, timestamp, payload).await
+            }
+            "app.annotation.set" => {
+                promote_annotation_set(graph, timestamp, payload).await
+            }
+            "app.annotation.cleared" => promote_annotation_cleared(graph, payload).await,
             _ => {
                 // Not yet promoted; will be handled in a later phase.
                 debug!(event_type, "skipping promotion for unhandled event type");
@@ -333,6 +367,534 @@ async fn link_file_to_project(
     }
 
     Ok(())
+}
+
+/// Promote an `app.presence.set` event into a UserAction node with
+/// `category = "presence"`. The metadata map and auto_clear hint stay in
+/// the SQLite event row — the graph node is intentionally lightweight so
+/// presence queries (e.g. "what was I editing yesterday at 14:00") stay
+/// fast and the per-app metadata schemas don't pollute the graph schema.
+async fn promote_presence_set(
+    graph: &GraphHandle,
+    event_id: &str,
+    timestamp: &i64,
+    payload: &[u8],
+) -> Result<()> {
+    let p = PresenceSetPayload::decode(payload)?;
+    let id_esc = escape_cypher(event_id);
+    let activity_esc = escape_cypher(&p.activity);
+    let subject_esc = escape_cypher(&p.subject);
+
+    graph
+        .write(format!(
+            "MERGE (u:UserAction {{id: '{id_esc}'}})
+             SET u.category = 'presence',
+                 u.action   = '{activity_esc}',
+                 u.subject  = '{subject_esc}',
+                 u.timestamp = {timestamp}"
+        ))
+        .await?;
+
+    debug!(event_id, app_id = %p.app_id, activity = %p.activity, "promoted app.presence.set");
+    Ok(())
+}
+
+/// Promote an `app.presence.clear` event. Apps emit this when their
+/// previous presence state is no longer accurate — explicit clear, or
+/// auto-clear from the SDK's window-blur listener. We record the clear
+/// as its own UserAction so a query can reconstruct presence intervals
+/// (set timestamp .. clear timestamp).
+async fn promote_presence_clear(
+    graph: &GraphHandle,
+    event_id: &str,
+    timestamp: &i64,
+    payload: &[u8],
+) -> Result<()> {
+    let p = PresenceClearPayload::decode(payload)?;
+    let id_esc = escape_cypher(event_id);
+    let app_esc = escape_cypher(&p.app_id);
+
+    graph
+        .write(format!(
+            "MERGE (u:UserAction {{id: '{id_esc}'}})
+             SET u.category = 'presence',
+                 u.action   = 'clear',
+                 u.subject  = '{app_esc}',
+                 u.timestamp = {timestamp}"
+        ))
+        .await?;
+
+    debug!(event_id, app_id = %p.app_id, "promoted app.presence.clear");
+    Ok(())
+}
+
+/// Promote an `app.timeline.record` event into a UserAction node with
+/// `category = "timeline"`. Persistent semantic record — distinct from
+/// presence which is ephemeral. Started/ended timestamps and metadata
+/// remain in the SQLite event row; the graph node carries the type as
+/// `action` and the user-facing label as `subject`.
+async fn promote_timeline_record(
+    graph: &GraphHandle,
+    event_id: &str,
+    _timestamp: &i64,
+    payload: &[u8],
+) -> Result<()> {
+    let p = TimelineRecordPayload::decode(payload)?;
+    let id_esc = escape_cypher(event_id);
+    let type_esc = escape_cypher(&p.r#type);
+    let label_esc = escape_cypher(&p.label);
+    // Use ended_at when present (duration event), otherwise started_at,
+    // and finally fall back to the wall-clock timestamp from the
+    // Event envelope. This keeps timeline queries time-ordered by the
+    // *user-meaningful* moment rather than when the event arrived.
+    let ts = if p.ended_at != 0 {
+        p.ended_at
+    } else if p.started_at != 0 {
+        p.started_at
+    } else {
+        *_timestamp
+    };
+
+    graph
+        .write(format!(
+            "MERGE (u:UserAction {{id: '{id_esc}'}})
+             SET u.category = 'timeline',
+                 u.action   = '{type_esc}',
+                 u.subject  = '{label_esc}',
+                 u.timestamp = {ts}"
+        ))
+        .await?;
+
+    debug!(event_id, app_id = %p.app_id, label = %p.label, "promoted app.timeline.record");
+    Ok(())
+}
+
+/// Promote an `app.annotation.set` event into an Annotation node
+/// keyed by the deterministic UUIDv5 of (target_type, target_id,
+/// namespace). MERGE-style upsert: re-setting on the same triple
+/// updates `data` and `last_modified` while preserving `created_at`.
+///
+/// Foundation §395 — apps write only to their own namespace, the
+/// daemon does not enforce that here yet (write-token-authentication
+/// is Phase 3.2-full); for now the SDK declares its own namespace
+/// honestly and the trust boundary is the SO_PEERCRED-derived uid on
+/// the producer socket.
+async fn promote_annotation_set(
+    graph: &GraphHandle,
+    timestamp: &i64,
+    payload: &[u8],
+) -> Result<()> {
+    let p = AnnotationSetPayload::decode(payload)?;
+    let id = annotation_id(&p.target_type, &p.target_id, &p.namespace);
+
+    let id_esc = escape_cypher(&id.to_string());
+    let ns_esc = escape_cypher(&p.namespace);
+    let tt_esc = escape_cypher(&p.target_type);
+    let ti_esc = escape_cypher(&p.target_id);
+    let data_esc = escape_cypher(&p.data_json);
+
+    // MERGE with ON CREATE / ON MATCH split so created_at is set
+    // exactly once on the very first write and `last_modified`
+    // advances on every subsequent re-set. Kuzu accepts the full
+    // openCypher MERGE clause; if a future Kuzu release narrows
+    // this we fall back to two queries (the test for replace-keeps-
+    // created_at would catch a regression).
+    graph
+        .write(format!(
+            "MERGE (a:Annotation {{id: '{id_esc}'}})
+             ON CREATE SET a.namespace = '{ns_esc}',
+                           a.target_type = '{tt_esc}',
+                           a.target_id = '{ti_esc}',
+                           a.data = '{data_esc}',
+                           a.created_at = {timestamp},
+                           a.last_modified = {timestamp}
+             ON MATCH SET a.data = '{data_esc}',
+                          a.last_modified = {timestamp}"
+        ))
+        .await?;
+
+    debug!(
+        target_type = %p.target_type,
+        target_id = %p.target_id,
+        namespace = %p.namespace,
+        annotation_id = %id,
+        "promoted app.annotation.set"
+    );
+    Ok(())
+}
+
+/// Promote an `app.annotation.cleared` event by removing the
+/// Annotation node keyed on the same deterministic id. Idempotent:
+/// clearing a non-existent annotation is a no-op (Kuzu's MATCH +
+/// DELETE silently affects zero rows).
+async fn promote_annotation_cleared(graph: &GraphHandle, payload: &[u8]) -> Result<()> {
+    let p = AnnotationClearPayload::decode(payload)?;
+    let id = annotation_id(&p.target_type, &p.target_id, &p.namespace);
+    let id_esc = escape_cypher(&id.to_string());
+
+    graph
+        .write(format!(
+            "MATCH (a:Annotation {{id: '{id_esc}'}}) DETACH DELETE a"
+        ))
+        .await?;
+
+    debug!(
+        target_type = %p.target_type,
+        target_id = %p.target_id,
+        namespace = %p.namespace,
+        annotation_id = %id,
+        "promoted app.annotation.cleared"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod shell_event_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use tempfile::TempDir;
+
+    async fn setup() -> (GraphHandle, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let graph =
+            crate::graph::spawn(tmp.path().join("graph").to_str().unwrap()).unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        (graph, tmp)
+    }
+
+    fn encode_presence_set(p: &PresenceSetPayload) -> Vec<u8> {
+        let mut buf = Vec::new();
+        p.encode(&mut buf).unwrap();
+        buf
+    }
+
+    fn encode_presence_clear(p: &PresenceClearPayload) -> Vec<u8> {
+        let mut buf = Vec::new();
+        p.encode(&mut buf).unwrap();
+        buf
+    }
+
+    fn encode_timeline(p: &TimelineRecordPayload) -> Vec<u8> {
+        let mut buf = Vec::new();
+        p.encode(&mut buf).unwrap();
+        buf
+    }
+
+    async fn count_user_actions_by_category(graph: &GraphHandle, category: &str) -> i64 {
+        let rs = graph
+            .query_rows(format!(
+                "MATCH (u:UserAction) WHERE u.category = '{category}' RETURN count(*) AS cnt"
+            ))
+            .await
+            .unwrap();
+        rs.rows
+            .first()
+            .and_then(|r| r.first())
+            .map(|v| v.as_i64())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn presence_set_creates_user_action() {
+        let (graph, _tmp) = setup().await;
+        let payload = PresenceSetPayload {
+            app_id: "com.example.editor".into(),
+            activity: "editing".into(),
+            subject: "/home/tim/notes.md".into(),
+            project: String::new(),
+            auto_clear: "on-blur".into(),
+            metadata: HashMap::new(),
+        };
+        let bytes = encode_presence_set(&payload);
+
+        promote_presence_set(&graph, "evt-presence-1", &1_000_000, &bytes)
+            .await
+            .unwrap();
+
+        assert_eq!(count_user_actions_by_category(&graph, "presence").await, 1);
+    }
+
+    #[tokio::test]
+    async fn presence_clear_creates_user_action() {
+        let (graph, _tmp) = setup().await;
+        let payload = PresenceClearPayload {
+            app_id: "com.example.editor".into(),
+        };
+        let bytes = encode_presence_clear(&payload);
+
+        promote_presence_clear(&graph, "evt-presence-clear-1", &2_000_000, &bytes)
+            .await
+            .unwrap();
+
+        // Clear is also a presence-category record.
+        let rs = graph
+            .query_rows(
+                "MATCH (u:UserAction) WHERE u.category = 'presence' AND u.action = 'clear' \
+                 RETURN u.subject"
+                    .to_string(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rs.rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn timeline_record_uses_ended_at_when_set() {
+        let (graph, _tmp) = setup().await;
+        let payload = TimelineRecordPayload {
+            app_id: "com.example.builder".into(),
+            label: "Build succeeded".into(),
+            subject: "coffeeshop".into(),
+            r#type: "build".into(),
+            started_at: 5_000_000,
+            ended_at: 9_500_000,
+            metadata: HashMap::new(),
+        };
+        let bytes = encode_timeline(&payload);
+
+        promote_timeline_record(&graph, "evt-timeline-1", &10_000_000, &bytes)
+            .await
+            .unwrap();
+
+        let rs = graph
+            .query_rows(
+                "MATCH (u:UserAction) WHERE u.category = 'timeline' \
+                 RETURN u.timestamp, u.action, u.subject"
+                    .to_string(),
+            )
+            .await
+            .unwrap();
+        let row = rs.rows.first().expect("user action created");
+        assert_eq!(row[0].as_i64(), 9_500_000); // ended_at wins
+        assert_eq!(row[1].as_str(), "build");
+        assert_eq!(row[2].as_str(), "Build succeeded");
+    }
+
+    #[tokio::test]
+    async fn timeline_record_falls_back_to_envelope_timestamp() {
+        let (graph, _tmp) = setup().await;
+        // Point-in-time event: both started_at and ended_at are 0 in the
+        // payload; promotion must fall back to the Event envelope's
+        // wall-clock timestamp.
+        let payload = TimelineRecordPayload {
+            app_id: "com.example.editor".into(),
+            label: "Exported PDF".into(),
+            subject: "/home/tim/report.pdf".into(),
+            r#type: "export".into(),
+            started_at: 0,
+            ended_at: 0,
+            metadata: HashMap::new(),
+        };
+        let bytes = encode_timeline(&payload);
+
+        promote_timeline_record(&graph, "evt-timeline-2", &7_777_777, &bytes)
+            .await
+            .unwrap();
+
+        let rs = graph
+            .query_rows(
+                "MATCH (u:UserAction) WHERE u.category = 'timeline' \
+                 RETURN u.timestamp"
+                    .to_string(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rs.rows[0][0].as_i64(), 7_777_777);
+    }
+
+    fn encode_annotation_set(p: &AnnotationSetPayload) -> Vec<u8> {
+        let mut buf = Vec::new();
+        p.encode(&mut buf).unwrap();
+        buf
+    }
+
+    fn encode_annotation_clear(p: &AnnotationClearPayload) -> Vec<u8> {
+        let mut buf = Vec::new();
+        p.encode(&mut buf).unwrap();
+        buf
+    }
+
+    async fn fetch_annotation(
+        graph: &GraphHandle,
+        target_type: &str,
+        target_id: &str,
+        namespace: &str,
+    ) -> Option<(String, i64, i64)> {
+        // Returns (data, created_at, last_modified) for the matching annotation.
+        let rs = graph
+            .query_rows(format!(
+                "MATCH (a:Annotation) WHERE a.target_type = '{target_type}' \
+                 AND a.target_id = '{target_id}' AND a.namespace = '{namespace}' \
+                 RETURN a.data, a.created_at, a.last_modified"
+            ))
+            .await
+            .unwrap();
+        rs.rows.first().map(|r| {
+            (
+                r[0].as_str().to_string(),
+                r[1].as_i64(),
+                r[2].as_i64(),
+            )
+        })
+    }
+
+    #[tokio::test]
+    async fn annotation_set_creates_node() {
+        let (graph, _tmp) = setup().await;
+        let payload = AnnotationSetPayload {
+            app_id: "com.example.editor".into(),
+            namespace: "com.example.editor".into(),
+            target_type: "File".into(),
+            target_id: "/home/tim/report.md".into(),
+            data_json: r#"{"word_count":1240}"#.into(),
+        };
+
+        promote_annotation_set(&graph, &1_000_000, &encode_annotation_set(&payload))
+            .await
+            .unwrap();
+
+        let got = fetch_annotation(&graph, "File", "/home/tim/report.md", "com.example.editor")
+            .await
+            .expect("annotation should exist");
+        assert_eq!(got.0, r#"{"word_count":1240}"#);
+        assert_eq!(got.1, 1_000_000); // created_at
+        assert_eq!(got.2, 1_000_000); // last_modified
+    }
+
+    #[tokio::test]
+    async fn annotation_re_set_replaces_data_and_keeps_created_at() {
+        let (graph, _tmp) = setup().await;
+        let p1 = AnnotationSetPayload {
+            app_id: "com.example.editor".into(),
+            namespace: "com.example.editor".into(),
+            target_type: "File".into(),
+            target_id: "/home/tim/notes.md".into(),
+            data_json: r#"{"word_count":100}"#.into(),
+        };
+        let p2 = AnnotationSetPayload {
+            app_id: "com.example.editor".into(),
+            namespace: "com.example.editor".into(),
+            target_type: "File".into(),
+            target_id: "/home/tim/notes.md".into(),
+            data_json: r#"{"word_count":250}"#.into(),
+        };
+
+        promote_annotation_set(&graph, &1_000, &encode_annotation_set(&p1))
+            .await
+            .unwrap();
+        promote_annotation_set(&graph, &5_000, &encode_annotation_set(&p2))
+            .await
+            .unwrap();
+
+        let got = fetch_annotation(&graph, "File", "/home/tim/notes.md", "com.example.editor")
+            .await
+            .unwrap();
+        assert_eq!(got.0, r#"{"word_count":250}"#); // new data
+        assert_eq!(got.1, 1_000); // original created_at preserved
+        assert_eq!(got.2, 5_000); // last_modified advanced
+    }
+
+    #[tokio::test]
+    async fn annotation_clear_removes_node() {
+        let (graph, _tmp) = setup().await;
+        let set_payload = AnnotationSetPayload {
+            app_id: "com.example.editor".into(),
+            namespace: "com.example.editor".into(),
+            target_type: "File".into(),
+            target_id: "/x".into(),
+            data_json: "{}".into(),
+        };
+        let clear_payload = AnnotationClearPayload {
+            app_id: "com.example.editor".into(),
+            namespace: "com.example.editor".into(),
+            target_type: "File".into(),
+            target_id: "/x".into(),
+        };
+
+        promote_annotation_set(&graph, &100, &encode_annotation_set(&set_payload))
+            .await
+            .unwrap();
+        assert!(fetch_annotation(&graph, "File", "/x", "com.example.editor")
+            .await
+            .is_some());
+
+        promote_annotation_cleared(&graph, &encode_annotation_clear(&clear_payload))
+            .await
+            .unwrap();
+        assert!(fetch_annotation(&graph, "File", "/x", "com.example.editor")
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn annotation_clear_on_missing_is_noop() {
+        let (graph, _tmp) = setup().await;
+        let clear_payload = AnnotationClearPayload {
+            app_id: "com.example.editor".into(),
+            namespace: "com.example.editor".into(),
+            target_type: "File".into(),
+            target_id: "/never-set".into(),
+        };
+        // Must not panic / error.
+        promote_annotation_cleared(&graph, &encode_annotation_clear(&clear_payload))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn annotation_id_is_deterministic_across_triple() {
+        // The UUIDv5 derivation is part of the wire contract: SDK
+        // queries by (target_type, target_id, namespace) but the
+        // graph node uses the derived id. If this drifts, queries
+        // return empty when annotations exist.
+        let id1 = annotation_id("File", "/x", "com.app");
+        let id2 = annotation_id("File", "/x", "com.app");
+        assert_eq!(id1, id2);
+
+        let id3 = annotation_id("File", "/y", "com.app");
+        assert_ne!(id1, id3);
+
+        let id4 = annotation_id("File", "/x", "com.other");
+        assert_ne!(id1, id4);
+    }
+
+    #[tokio::test]
+    async fn annotation_namespaces_are_independent_for_same_target() {
+        // Two apps annotate the same File — must produce two
+        // independent Annotation nodes, each addressable by its own
+        // namespace.
+        let (graph, _tmp) = setup().await;
+        let editor = AnnotationSetPayload {
+            app_id: "com.example.editor".into(),
+            namespace: "com.example.editor".into(),
+            target_type: "File".into(),
+            target_id: "/shared.md".into(),
+            data_json: r#"{"word_count":500}"#.into(),
+        };
+        let git = AnnotationSetPayload {
+            app_id: "com.example.git".into(),
+            namespace: "com.example.git".into(),
+            target_type: "File".into(),
+            target_id: "/shared.md".into(),
+            data_json: r#"{"branch":"main"}"#.into(),
+        };
+
+        promote_annotation_set(&graph, &10, &encode_annotation_set(&editor))
+            .await
+            .unwrap();
+        promote_annotation_set(&graph, &20, &encode_annotation_set(&git))
+            .await
+            .unwrap();
+
+        let editor_got = fetch_annotation(&graph, "File", "/shared.md", "com.example.editor")
+            .await
+            .unwrap();
+        let git_got = fetch_annotation(&graph, "File", "/shared.md", "com.example.git")
+            .await
+            .unwrap();
+        assert_eq!(editor_got.0, r#"{"word_count":500}"#);
+        assert_eq!(git_got.0, r#"{"branch":"main"}"#);
+    }
 }
 
 #[cfg(test)]

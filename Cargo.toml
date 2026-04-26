@@ -14,7 +14,7 @@ prost = "0.13"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-uuid = { version = "1", features = ["v7", "serde"] }
+uuid = { version = "1", features = ["v5", "v7", "serde"] }
 lbug = "0.15.2"
 hmac = "0.12"
 sha2 = "0.10"
