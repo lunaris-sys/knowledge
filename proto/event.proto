@@ -35,6 +35,26 @@ message WindowFocusedPayload {
   string prev_app_id  = 3;  // previously focused app, empty if none
 }
 
+// Emitted when a window transitions to minimized state. The shell
+// derives its own minimized-windows UI from cosmic-toplevel-info
+// state (the authoritative source for live UI); this event exists so
+// the Knowledge Graph can record the transition for future analytics
+// (time-in-minimized, app-specific minimize patterns, etc.).
+// Event type: "window.minimized"
+message WindowMinimizedPayload {
+  string window_id    = 1;  // stable toplevel identifier
+  string app_id       = 2;
+  string window_title = 3;
+  string workspace_id = 4;  // ext workspace handle id, may be empty
+}
+
+// Emitted when a minimized window is restored (unminimized).
+// Event type: "window.unminimized"
+message WindowUnminimizedPayload {
+  string window_id = 1;
+  string app_id    = 2;
+}
+
 // Emitted when a clipboard operation occurs.
 // Content is never included.
 // Event type: "clipboard.copy" | "clipboard.paste"
