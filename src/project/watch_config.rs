@@ -16,6 +16,14 @@ pub struct WatchConfig {
     /// Maximum recursion depth when scanning.
     #[serde(default = "default_max_depth")]
     pub max_depth: usize,
+
+    /// Auto-promote an inferred project after this many distinct
+    /// files have been opened in one session. Lower = faster
+    /// promotion, more noise; higher = slower, only well-used
+    /// projects surface in Waypointer / Focus Mode. Was a
+    /// hardcoded `3` until Sprint C made it user-configurable.
+    #[serde(default = "default_auto_promote_threshold")]
+    pub auto_promote_threshold: usize,
 }
 
 fn default_watch_dirs() -> Vec<String> {
@@ -32,11 +40,16 @@ fn default_max_depth() -> usize {
     3
 }
 
+fn default_auto_promote_threshold() -> usize {
+    3
+}
+
 impl Default for WatchConfig {
     fn default() -> Self {
         Self {
             watch_directories: default_watch_dirs(),
             max_depth: default_max_depth(),
+            auto_promote_threshold: default_auto_promote_threshold(),
         }
     }
 }
@@ -126,5 +139,35 @@ max_depth = 2
         let gc: GraphConfig = toml::from_str("").unwrap();
         assert!(!gc.projects.watch_directories.is_empty());
         assert_eq!(gc.projects.max_depth, 3);
+    }
+
+    /// Sprint C added `auto_promote_threshold`. Existing user
+    /// graph.toml files without the field must still parse and
+    /// fall back to 3 — otherwise upgrading would crash the
+    /// daemon on first start.
+    #[test]
+    fn missing_threshold_falls_back_to_default() {
+        let toml = r#"
+[projects]
+watch_directories = ["/tmp/projects"]
+max_depth = 2
+"#;
+        let gc: GraphConfig = toml::from_str(toml).unwrap();
+        assert_eq!(
+            gc.projects.auto_promote_threshold, 3,
+            "missing threshold must default to 3 (compositor #29 era \
+             behaviour) — change with care, this affects every existing \
+             user's graph.toml"
+        );
+    }
+
+    #[test]
+    fn explicit_threshold_overrides_default() {
+        let toml = r#"
+[projects]
+auto_promote_threshold = 7
+"#;
+        let gc: GraphConfig = toml::from_str(toml).unwrap();
+        assert_eq!(gc.projects.auto_promote_threshold, 7);
     }
 }

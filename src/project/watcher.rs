@@ -373,6 +373,7 @@ mod tests {
         let config = WatchConfig {
             watch_directories: vec![watch_dir.to_string_lossy().to_string()],
             max_depth: 3,
+            auto_promote_threshold: 3,
         };
         let store = Arc::new(ProjectStore::new(graph));
         // Leak graph_tmp so it lives for the test duration.
@@ -464,6 +465,7 @@ mod tests {
         let config = WatchConfig {
             watch_directories: vec![tmp.path().to_string_lossy().to_string()],
             max_depth: 3,
+            auto_promote_threshold: 3,
         };
         let graph_tmp = TempDir::new().unwrap();
         let graph =
