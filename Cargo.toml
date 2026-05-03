@@ -33,6 +33,7 @@ toml = "0.8"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
 shellexpand = "3"
+lunaris-permissions = { path = "../sdk/permissions" }
 regex = "1"
 
 [dev-dependencies]
