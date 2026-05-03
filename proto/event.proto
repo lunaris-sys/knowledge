@@ -217,3 +217,232 @@ message AnnotationClearPayload {
   string target_type = 3;
   string target_id   = 4;
 }
+
+// ── shell.toolbar surface ──────────────────────────────────────
+// Foundation §6.4 Listings 22-24. Apps push three mutually-
+// exclusive elements into the top bar's `slot-toolbar`: Quick
+// Actions, Breadcrumb, or Progress. The shell renders only the
+// focused window's slot content; on focus loss the rendered
+// slot clears (state remains in shell-side per-(app, window)
+// store until the window emits `cleared`, the window closes,
+// or the app process exits).
+//
+// All payloads carry a `window_id` so the shell can key state
+// per-window (multi-window apps need distinct toolbars per
+// window) and route action dispatch back to the originating
+// webview specifically. Empty `window_id` is the legacy
+// fallback (single-window emulation, broadcast on dispatch).
+
+// Single Quick Action button. Max 3 per emit (SDK-enforced).
+// Event type embeds these inside ToolbarQuickActionsPayload.
+message ToolbarQuickAction {
+  string icon    = 1;  // ui-kit / Lucide icon id
+  string action  = 2;  // opaque action identifier dispatched to app
+  string tooltip = 3;
+  bool   toggle  = 4;
+  bool   active  = 5;
+}
+
+// Event type: "app.toolbar.quick_actions"
+message ToolbarQuickActionsPayload {
+  string app_id    = 1;
+  repeated ToolbarQuickAction actions = 2;  // up to 3
+  string window_id = 3;  // Tauri webview label, "" = legacy single-window
+}
+
+message ToolbarBreadcrumbItem {
+  string label  = 1;
+  string action = 2;
+}
+
+// Event type: "app.toolbar.breadcrumb"
+message ToolbarBreadcrumbPayload {
+  string app_id    = 1;
+  repeated ToolbarBreadcrumbItem items = 2;
+  string window_id = 3;
+}
+
+// Event type: "app.toolbar.progress"
+message ToolbarProgressPayload {
+  string app_id    = 1;
+  // Clamped to [0.0, 1.0] SDK-side before emit. Non-finite
+  // inputs (NaN, +/-Infinity) are rejected at the SDK layer.
+  float  value     = 2;
+  string label     = 3;
+  string window_id = 4;
+}
+
+// Event type: "app.toolbar.progress_cleared"
+message ToolbarProgressClearedPayload {
+  string app_id    = 1;
+  string window_id = 2;
+}
+
+// Event type: "app.toolbar.cleared"
+// Drops every toolbar variant for the (app, window) pair.
+// Distinct from `progress_cleared` which only drops Progress.
+message ToolbarClearedPayload {
+  string app_id    = 1;
+  string window_id = 2;
+}
+
+// Event type: "app.toolbar.action_invoked"
+// Emitted by the desktop-shell when the user clicks a Quick
+// Action or Breadcrumb segment. The source app's
+// tauri-plugin-shell consumes this, filters by matching its
+// own LUNARIS_APP_ID, and re-emits as a per-webview Tauri
+// event scoped to `window_id` so multi-window apps route the
+// click to the originating webview only.
+message ToolbarActionInvokedPayload {
+  string app_id    = 1;  // target app id (filter side)
+  string action    = 2;  // opaque action string defined by the app
+  string window_id = 3;  // target webview label
+}
+
+// ── shell.shortcuts surface ────────────────────────────────────
+// Foundation §6.4 Listing 13. Apps register a list of
+// discoverable quick-actions that surface in Waypointer when
+// focused. Per-app (not per-window) — see shortcuts-api.md FA1.
+
+message Shortcut {
+  string label   = 1;
+  string icon    = 2;  // ui-kit / Lucide icon id
+  string action  = 3;  // opaque dispatch identifier
+  // Tag filter for Focus-Mode-aware rendering. Phase 1 ignores
+  // this field; Phase 6 brings tag-aware filtering once the
+  // project tag system lands. Stays in the wire as forward-
+  // compat.
+  repeated string context = 4;
+  // Optional confirmation text. When non-empty the shell shows
+  // a yes/no dialog with this text before dispatching the
+  // click.
+  string confirm = 5;
+}
+
+// Event type: "app.shortcut.register"
+// Full-replace registration: drops the app's previous list
+// and replaces with `shortcuts`. Empty `shortcuts` acts as
+// `clear`.
+message ShortcutRegisterPayload {
+  string app_id = 1;
+  repeated Shortcut shortcuts = 2;
+}
+
+// Event type: "app.shortcut.state_changed"
+// Diff-update for one shortcut's per-instance state without
+// re-emitting the full list. `enabled` and `badge` are
+// optional — unset fields stay at their previous values.
+message ShortcutStateChangedPayload {
+  string app_id      = 1;
+  string action      = 2;  // identifies which shortcut to update
+  optional bool   enabled = 3;
+  optional string badge   = 4;  // small text overlay, "" clears
+}
+
+// Event type: "app.shortcut.cleared"
+// Drops every shortcut for the app. Equivalent to
+// `register([])` but distinct event type for audit clarity.
+message ShortcutClearedPayload {
+  string app_id = 1;
+}
+
+// Event type: "app.shortcut.action_invoked"
+// Emitted by the desktop-shell when the user picks a
+// shortcut in Waypointer. Same payload shape as
+// ToolbarActionInvokedPayload — apps' frontend onAction
+// handler receives both surfaces uniformly. `window_id` is
+// the focused window at click-time so multi-window apps
+// route correctly.
+message ShortcutActionInvokedPayload {
+  string app_id    = 1;
+  string action    = 2;
+  string window_id = 3;
+}
+
+// ── shell.badges surface ───────────────────────────────────────
+// Foundation §6.4 Listing 14. Per-app status indicator
+// rendered as a small overlay on the GlobalMenuBar app name
+// when focused. See badges-api.md.
+
+enum BadgeStatus {
+  BADGE_STATUS_UNSPECIFIED = 0;
+  BADGE_STATUS_SUCCESS     = 1;
+  BADGE_STATUS_WARNING     = 2;
+  BADGE_STATUS_ERROR       = 3;
+  BADGE_STATUS_PROGRESS    = 4;
+}
+
+// Event type: "app.badge.set"
+// Mutually exclusive: setting a new badge replaces any
+// previous one for the app. Only error / warning are
+// promoted to the Knowledge Graph — count-only / dot are
+// not (foundation Listing 14).
+message BadgeSetPayload {
+  string app_id = 1;
+  // Variant selector: 0=count, 1=dot, 2=status, 3=count+status.
+  // Encoded as an enum so the wire is self-documenting.
+  BadgeVariant variant = 2;
+  uint32 count = 3;          // valid for variant=count|count_with_status
+  BadgeStatus status = 4;    // valid for variant=status|count_with_status
+  // Status=progress carries a fill value in [0.0, 1.0].
+  // Non-finite rejected SDK-side.
+  optional float progress_value = 5;
+}
+
+enum BadgeVariant {
+  BADGE_VARIANT_UNSPECIFIED       = 0;
+  BADGE_VARIANT_COUNT             = 1;
+  BADGE_VARIANT_DOT               = 2;
+  BADGE_VARIANT_STATUS            = 3;
+  BADGE_VARIANT_COUNT_WITH_STATUS = 4;
+}
+
+// Event type: "app.badge.cleared"
+message BadgeClearedPayload {
+  string app_id = 1;
+}
+
+// ── shell.ambient surface ──────────────────────────────────────
+// Foundation §6.4 Listing 17. Subtle visual effect on the
+// desktop while the app is focused. See ambient-api.md.
+
+enum AmbientEffect {
+  AMBIENT_EFFECT_UNSPECIFIED = 0;
+  AMBIENT_EFFECT_PULSE       = 1;
+  AMBIENT_EFFECT_TINT        = 2;
+}
+
+enum AmbientColor {
+  AMBIENT_COLOR_UNSPECIFIED = 0;
+  AMBIENT_COLOR_ACCENT      = 1;
+  AMBIENT_COLOR_WARNING     = 2;
+  AMBIENT_COLOR_ERROR       = 3;
+  AMBIENT_COLOR_SUCCESS     = 4;
+}
+
+enum AmbientSpeed {
+  AMBIENT_SPEED_UNSPECIFIED = 0;
+  AMBIENT_SPEED_SLOW        = 1;
+  AMBIENT_SPEED_MEDIUM      = 2;
+  AMBIENT_SPEED_FAST        = 3;
+}
+
+// Event type: "app.ambient.set"
+message AmbientSetPayload {
+  string app_id = 1;
+  AmbientEffect effect = 2;
+  AmbientColor  color  = 3;
+  // SDK-clamped to [0.0, 0.5] before emit; non-finite rejected.
+  float intensity = 4;
+  AmbientSpeed speed = 5;
+  // Free-form, for debug / future audit. Not rendered.
+  string reason = 6;
+  // Optional shell-side autoClear timer in milliseconds. 0
+  // means no auto-clear (app must explicitly call clear).
+  uint32 auto_clear_ms = 7;
+}
+
+// Event type: "app.ambient.cleared"
+message AmbientClearedPayload {
+  string app_id = 1;
+}

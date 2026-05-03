@@ -1,8 +1,9 @@
 use crate::graph::GraphHandle;
 use crate::project::ProjectStore;
 use crate::proto::{
-    AnnotationClearPayload, AnnotationSetPayload, FileOpenedPayload, PresenceClearPayload,
-    PresenceSetPayload, TimelineRecordPayload, WindowFocusedPayload,
+    AnnotationClearPayload, AnnotationSetPayload, BadgeSetPayload, BadgeStatus,
+    FileOpenedPayload, PresenceClearPayload, PresenceSetPayload, TimelineRecordPayload,
+    WindowFocusedPayload,
 };
 use crate::utils::escape_cypher;
 use anyhow::Result;
@@ -194,6 +195,7 @@ async fn run_pass(
                 promote_annotation_set(graph, timestamp, payload).await
             }
             "app.annotation.cleared" => promote_annotation_cleared(graph, payload).await,
+            "app.badge.set" => promote_badge_set(graph, id, timestamp, payload).await,
             _ => {
                 // Not yet promoted; will be handled in a later phase.
                 debug!(event_type, "skipping promotion for unhandled event type");
@@ -559,6 +561,59 @@ async fn promote_annotation_cleared(graph: &GraphHandle, payload: &[u8]) -> Resu
         namespace = %p.namespace,
         annotation_id = %id,
         "promoted app.annotation.cleared"
+    );
+    Ok(())
+}
+
+/// Promote an `app.badge.set` event into a UserAction node —
+/// but only for `error` / `warning` status. Foundation §6.4
+/// Listing 14: "Error and warning badges are recorded in the
+/// Knowledge Graph; count-only badges are not."
+///
+/// `category = "badge"`, `action = "error" | "warning"`,
+/// `subject = app_id`. Reuses the existing UserAction schema;
+/// no new node type. AI queries can correlate badge spikes
+/// with build / test failures over time.
+async fn promote_badge_set(
+    graph: &GraphHandle,
+    event_id: &str,
+    timestamp: &i64,
+    payload: &[u8],
+) -> Result<()> {
+    let p = BadgeSetPayload::decode(payload)?;
+    let status_kind = match BadgeStatus::try_from(p.status).unwrap_or(BadgeStatus::Unspecified) {
+        BadgeStatus::Error => "error",
+        BadgeStatus::Warning => "warning",
+        // Success / Progress / Unspecified / count-only — not promoted.
+        _ => {
+            debug!(
+                event_id,
+                app_id = %p.app_id,
+                status = p.status,
+                "badge not promoted (status not error/warning)"
+            );
+            return Ok(());
+        }
+    };
+
+    let id_esc = escape_cypher(event_id);
+    let app_esc = escape_cypher(&p.app_id);
+
+    graph
+        .write(format!(
+            "MERGE (u:UserAction {{id: '{id_esc}'}})
+             SET u.category = 'badge',
+                 u.action   = '{status_kind}',
+                 u.subject  = '{app_esc}',
+                 u.timestamp = {timestamp}"
+        ))
+        .await?;
+
+    debug!(
+        event_id,
+        app_id = %p.app_id,
+        status = status_kind,
+        "promoted app.badge.set"
     );
     Ok(())
 }
