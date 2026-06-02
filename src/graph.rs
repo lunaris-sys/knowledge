@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use lbug::{Connection, Database, SystemConfig, Value};
-use std::sync::mpsc;
 use std::thread;
+use tokio::sync::mpsc;
 use tracing::{debug, info};
 
 /// A cell value extracted from a Ladybug QueryResult, safe to send
@@ -43,10 +43,13 @@ pub struct RowSet {
 /// A message sent to the Ladybug thread.
 /// Each variant carries a one-shot channel to send the result back.
 ///
-/// We use `std::sync::mpsc` (not tokio) because Ladybug's Connection is not
-/// Send and must stay on the same thread. The Ladybug thread owns a regular
-/// std channel receiver; async callers send via the std sender and then
-/// await a tokio oneshot for the response.
+/// The request channel is a bounded `tokio::sync::mpsc` (1024 slots) because
+/// Ladybug's Connection is not Send and must stay on the dedicated thread.
+/// Async callers `send().await` the request (which yields cooperatively under
+/// backpressure instead of blocking a runtime worker, the difference that lets
+/// the query daemon's per-request timeout actually bound the client wait), and
+/// then await a tokio oneshot for the response. The Ladybug thread is a plain
+/// OS thread with no runtime and drains the receiver via `blocking_recv`.
 pub enum GraphRequest {
     /// Execute a Cypher query and return the raw result as a string.
     Query {
@@ -66,7 +69,7 @@ pub enum GraphRequest {
 /// Clone this to get additional senders to the same thread.
 #[derive(Clone)]
 pub struct GraphHandle {
-    sender: mpsc::SyncSender<GraphRequest>,
+    sender: mpsc::Sender<GraphRequest>,
 }
 
 impl GraphHandle {
@@ -81,6 +84,7 @@ impl GraphHandle {
                 cypher,
                 reply: reply_tx,
             })
+            .await
             .map_err(|_| anyhow!("ladybug thread has stopped"))?;
         reply_rx
             .await
@@ -101,6 +105,7 @@ impl GraphHandle {
                 cypher,
                 reply: reply_tx,
             })
+            .await
             .map_err(|_| anyhow!("ladybug thread has stopped"))?;
         reply_rx
             .await
@@ -114,7 +119,7 @@ impl GraphHandle {
     pub fn query_rows_sync(&self, cypher: String) -> Result<RowSet> {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.sender
-            .send(GraphRequest::QueryRows {
+            .blocking_send(GraphRequest::QueryRows {
                 cypher,
                 reply: reply_tx,
             })
@@ -140,10 +145,10 @@ impl GraphHandle {
 pub fn spawn(path: &str) -> Result<GraphHandle> {
     let path = path.to_string();
 
-    // SyncSender with a bounded buffer of 1024 pending requests.
-    // If the Ladybug thread falls behind, senders will block.
-    // 1024 is generous; normal load is much lower.
-    let (tx, rx) = mpsc::sync_channel::<GraphRequest>(1024);
+    // Bounded channel with 1024 pending-request slots. If the Ladybug thread
+    // falls behind, async senders await (yielding the worker) rather than
+    // blocking it. 1024 is generous; normal load is much lower.
+    let (tx, rx) = mpsc::channel::<GraphRequest>(1024);
 
     thread::Builder::new()
         .name("ladybug".to_string())
@@ -157,7 +162,7 @@ pub fn spawn(path: &str) -> Result<GraphHandle> {
 }
 
 /// The body of the dedicated Ladybug thread.
-fn ladybug_thread(path: &str, rx: mpsc::Receiver<GraphRequest>) -> Result<()> {
+fn ladybug_thread(path: &str, mut rx: mpsc::Receiver<GraphRequest>) -> Result<()> {
     let db = Database::new(path, SystemConfig::default())
         .map_err(|e| anyhow!("failed to open ladybug database: {e}"))?;
     let conn = Connection::new(&db)
@@ -167,7 +172,7 @@ fn ladybug_thread(path: &str, rx: mpsc::Receiver<GraphRequest>) -> Result<()> {
     create_schema(&conn)?;
     info!("ladybug schema ready");
 
-    for request in rx {
+    while let Some(request) = rx.blocking_recv() {
         match request {
             GraphRequest::Query { cypher, reply } => {
                 debug!(cypher = %cypher, "executing cypher");

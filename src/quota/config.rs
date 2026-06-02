@@ -83,14 +83,34 @@ pub struct QuotaConfig {
 }
 
 impl QuotaConfig {
-    /// Load from TOML file (returns defaults if file missing).
+    /// Load from TOML file (returns the Lunaris default if missing).
     pub fn load(path: &Path) -> Result<Self, std::io::Error> {
         if !path.exists() {
-            return Ok(Self::default());
+            return Ok(Self::lunaris_default());
         }
         let content = std::fs::read_to_string(path)?;
         toml::from_str(&content)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    }
+
+    /// The default config the live query daemon uses when no
+    /// `graph.toml` quota section is present.
+    ///
+    /// The canonical identity resolver yields bare ids for system
+    /// binaries (`ai-daemon`, `ai-agent`) rather than `org.lunaris.*`,
+    /// so they must be named here to receive the AI layer's higher
+    /// (FirstParty, 1000 qps) limit — foundation §8.4: "the AI daemon
+    /// has a higher sustained limit." Without this they would fall to
+    /// ThirdParty (100 qps) and be wrongly throttled. Genuine
+    /// provenance-based tiering (canonical /usr install vs a
+    /// user-installed lookalike of the same id) shares the F3 identity
+    /// gap's future fix (the installd inode registry); a `graph.toml`
+    /// may extend `first_party_apps` for other first-party apps.
+    pub fn lunaris_default() -> Self {
+        Self {
+            first_party_apps: vec!["ai-daemon".to_string(), "ai-agent".to_string()],
+            overrides: HashMap::new(),
+        }
     }
 
     /// Determine the tier for an app.
