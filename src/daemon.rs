@@ -348,12 +348,16 @@ async fn handle_client(
             return Ok(());
         }
 
-        // Read query string.
+        // Read query string. A leading 0x01 byte selects the structured
+        // (typed JSON RowSet) response mode; without it the request is a
+        // legacy raw-Cypher text query, so existing clients are unaffected.
         let mut buf = vec![0u8; len];
         stream.read_exact(&mut buf).await?;
-        let cypher = String::from_utf8(buf)?;
+        let typed_rows = buf.first() == Some(&0x01);
+        let cypher_bytes = if typed_rows { &buf[1..] } else { &buf[..] };
+        let cypher = String::from_utf8(cypher_bytes.to_vec())?;
 
-        debug!(cypher = %cypher, "received query");
+        debug!(cypher = %cypher, typed_rows, "received query");
 
         // Per-identity rate limit, before any work.
         let violation = {
@@ -364,6 +368,12 @@ async fn handle_client(
             }
         };
 
+        // Failure responses are the plaintext `ERROR: ...` form in both
+        // modes; a typed client detects the `ERROR:` prefix before parsing
+        // JSON (the SDK does). Wrapping every typed failure in a structured
+        // JSON envelope (stable code + message) so a typed client can tell
+        // RateLimited from QueryTimeout is a follow-up; today the sole typed
+        // consumer fails closed on any error, so the category is not needed.
         let (response, emit_violation) = if let Some((reason, emit)) = violation {
             warn!(app_id = %app_id, "graph query rate limit exceeded");
             (format!("ERROR: RateLimited: {reason}"), emit)
@@ -383,15 +393,26 @@ async fn handle_client(
             // the caller; it does not abort the graph worker's in-flight
             // query, which runs to completion — a true execution deadline
             // needs an interruptible graph API and is a follow-up.
-            let r = match tokio::time::timeout(
-                Duration::from_millis(500),
-                graph.query(cypher),
-            )
-            .await
-            {
-                Ok(Ok(result)) => result,
-                Ok(Err(e)) => format!("ERROR: {e}"),
-                Err(_elapsed) => "ERROR: QueryTimeout".to_string(),
+            let r = if typed_rows {
+                // The Ladybug thread serialises the rows to JSON, so this
+                // deadline bounds the query AND its serialisation together
+                // (the text branch below serialises on that thread too).
+                match tokio::time::timeout(
+                    Duration::from_millis(500),
+                    graph.query_rows_json(cypher),
+                )
+                .await
+                {
+                    Ok(Ok(json)) => json,
+                    Ok(Err(e)) => format!("ERROR: {e}"),
+                    Err(_elapsed) => "ERROR: QueryTimeout".to_string(),
+                }
+            } else {
+                match tokio::time::timeout(Duration::from_millis(500), graph.query(cypher)).await {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(e)) => format!("ERROR: {e}"),
+                    Err(_elapsed) => "ERROR: QueryTimeout".to_string(),
+                }
             };
             (r, false)
         };
@@ -424,14 +445,49 @@ async fn handle_client(
 }
 
 /// Check if a Cypher query contains write operations.
+///
+/// A write clause can appear anywhere, not only at the start (`MATCH (n)
+/// DELETE n`, `MATCH (a) MERGE (b)`), so this scans whole-word tokens rather
+/// than the leading keyword, skipping single-quoted string literals so a
+/// value that merely contains a keyword (e.g. a path with `DELETE` in it) is
+/// not mistaken for a write. It over-rejects rather than under-rejects (a
+/// read whose identifier collides with a keyword is refused, never a write
+/// let through), which is the safe direction for a read-only socket.
+///
+/// This is a lexical guard, not a parser; the robust form is read-only
+/// enforcement in the graph engine (a read-only connection/transaction), a
+/// follow-up that would protect both this and the text query path at the
+/// execution layer rather than by inspecting the query text.
 fn is_write_query(cypher: &str) -> bool {
-    let upper = cypher.trim().to_uppercase();
-    upper.starts_with("CREATE")
-        || upper.starts_with("MERGE")
-        || upper.starts_with("DELETE")
-        || upper.starts_with("SET")
-        || upper.starts_with("REMOVE")
-        || upper.starts_with("DROP")
+    const WRITE_KEYWORDS: [&str; 7] = [
+        "CREATE", "MERGE", "DELETE", "SET", "REMOVE", "DROP", "DETACH",
+    ];
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut token = String::new();
+    for ch in cypher.chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '\'' {
+                in_string = false;
+            }
+            continue;
+        }
+        match ch {
+            '\'' => in_string = true,
+            c if c.is_ascii_alphanumeric() || c == '_' => token.push(c.to_ascii_uppercase()),
+            _ => {
+                if WRITE_KEYWORDS.contains(&token.as_str()) {
+                    return true;
+                }
+                token.clear();
+            }
+        }
+    }
+    WRITE_KEYWORDS.contains(&token.as_str())
 }
 
 #[cfg(test)]
@@ -448,9 +504,22 @@ mod tests {
     }
 
     #[test]
+    fn detects_writes_that_do_not_start_with_the_keyword() {
+        // The leading-token check missed these; the token scan catches them.
+        assert!(is_write_query("MATCH (n:File) DELETE n"));
+        assert!(is_write_query("MATCH (a:App) MERGE (b:Session)"));
+        assert!(is_write_query("MATCH (n) SET n.name = 'x' RETURN n"));
+        assert!(is_write_query("MATCH (n) DETACH DELETE n"));
+    }
+
+    #[test]
     fn allows_read_queries() {
         assert!(!is_write_query("MATCH (n:File) RETURN n"));
         assert!(!is_write_query("MATCH (a:App) WHERE a.id = 'x' RETURN a.name"));
+        // A write keyword inside a string literal is a value, not a clause.
+        assert!(!is_write_query(
+            "MATCH (f:File) WHERE f.path = '/home/tim/DELETE/x' RETURN f.id"
+        ));
     }
 
     #[tokio::test]
