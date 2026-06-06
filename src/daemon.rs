@@ -414,16 +414,31 @@ async fn handle_write_request(
     }
 }
 
-/// Persist an authorised relation with a *checked* MATCH/MERGE.
+/// Persist an authorised relation with an **atomic conditional create** that
+/// reports whether it actually created the edge.
 ///
 /// The endpoint types were validated as built-in system types, so their graph
 /// table name is the type minus the `system.` prefix and the relation label is
 /// a known identifier from the allowlist; none of those are attacker-controlled.
 /// Only the endpoint ids are caller-supplied, so they are escaped into the
-/// Cypher string literals. `RETURN count(*)` is 0 when a MATCH bound nothing (an
-/// absent endpoint), which is reported as not-found rather than a false success;
-/// the MATCH + MERGE + RETURN run as one statement, so there is no check/merge
-/// TOCTOU window.
+/// Cypher string literals.
+///
+/// The create is a single statement (`OPTIONAL MATCH ... WHERE r IS NULL CREATE
+/// ... RETURN count`) on the dedicated, serial graph thread, so create-only-
+/// if-absent cannot race a concurrent create: a second creator's statement runs
+/// after the first and sees the edge, so it creates nothing. `created` is 1 iff
+/// THIS statement created the edge, so a single attempt can distinguish a create
+/// from a no-op and never double-creates. Three outcomes: `OK: created`,
+/// `OK: exists` (idempotent no-op), or `ERROR: relation endpoints not found`.
+///
+/// The signal is per-*statement*, not per logical operation: if a create commits
+/// but its response is lost and the call is retried, the retry sees the edge and
+/// reports `exists`. So this is NOT a durable record of which logical operation
+/// created the edge. A compensator that must survive at-least-once retries needs
+/// durable operation identity (an idempotency key persisted with the edge), the
+/// deferred executor-design follow-up; today the agent's executor re-validates
+/// before each write, so a fresh retry whose edge now exists fails its
+/// `Not(EdgeExists)` proof and writes nothing, the interim guard.
 ///
 /// Row-level ownership/visibility on the matched endpoints is intentionally not
 /// enforced here. The authorisation gate in `create_relation` already requires a
@@ -439,43 +454,57 @@ async fn persist_relation(graph: &GraphHandle, rel: &RelationResult) -> String {
         .strip_prefix("system.")
         .unwrap_or(&rel.from_type);
     let to_label = rel.to_type.strip_prefix("system.").unwrap_or(&rel.to_type);
-    let cypher = format!(
-        "MATCH (a:{from_label} {{id: '{from_id}'}}), (b:{to_label} {{id: '{to_id}'}}) \
-         MERGE (a)-[:{rel_type}]->(b) RETURN count(*) AS n",
-        from_label = from_label,
-        to_label = to_label,
-        rel_type = rel.relation_type,
-        from_id = escape_cypher(&rel.from_id),
-        to_id = escape_cypher(&rel.to_id),
-    );
+    let rel_type = &rel.relation_type;
+    let from_id = escape_cypher(&rel.from_id);
+    let to_id = escape_cypher(&rel.to_id);
 
-    // A write awaits its actual result, with no client-side timeout, so the
-    // response is definitive: `OK` means the edge is committed, an `ERROR`
-    // means it is not. The read path uses a 500 ms deadline to bound the
-    // client wait, but applying it here would be wrong for a mutation: the
-    // graph worker API is not cancellable, so a timeout would unblock the
-    // caller while the queued MERGE could still commit later, reporting
-    // failure for a write that succeeds. The operation is small (an indexed
-    // MATCH on two ids) and the per-identity write bucket bounds its
-    // frequency, so awaiting is safe. MERGE is idempotent, so a transport
-    // failure and retry is also safe: the second MERGE finds the edge and
-    // still reports `OK`.
-    match graph.query_rows(cypher).await {
-        Ok(rowset) => {
-            let count = rowset
-                .rows
-                .first()
-                .and_then(|r| r.first())
-                .map(|c| c.as_i64())
-                .unwrap_or(0);
-            if count > 0 {
-                "OK".to_string()
-            } else {
-                "ERROR: relation endpoints not found".to_string()
-            }
-        }
+    // Atomic conditional create. `created` = 1 only if this statement created
+    // the edge; 0 if the edge already existed (the `WHERE r IS NULL` filters its
+    // row out) OR an endpoint is missing (the MATCH binds nothing). The write
+    // awaits its definitive result with no client-side timeout: the graph worker
+    // is not cancellable, so a timeout would unblock the caller while the queued
+    // CREATE could still commit, mis-reporting a committed write.
+    let create_cypher = format!(
+        "MATCH (a:{from_label} {{id: '{from_id}'}}), (b:{to_label} {{id: '{to_id}'}}) \
+         OPTIONAL MATCH (a)-[r:{rel_type}]->(b) WITH a, b, r WHERE r IS NULL \
+         CREATE (a)-[:{rel_type}]->(b) RETURN count(*) AS created"
+    );
+    let created = match graph.query_rows(create_cypher).await {
+        Ok(rs) => row_count(&rs),
+        Err(e) => return format!("ERROR: {e}"),
+    };
+    if created > 0 {
+        return "OK: created".to_string();
+    }
+
+    // created == 0 means either the edge already existed or an endpoint was
+    // missing at create time. Disambiguate by checking the EDGE itself, never
+    // merely the endpoints: an endpoint that a concurrent writer adds *after*
+    // the create matched nothing must not be mistaken for a successful link.
+    // `OK: exists` is therefore reported only when the edge genuinely exists
+    // now (benign idempotent no-op); otherwise the link was not made and a
+    // retryable not-found is returned. A concurrent writer that created the
+    // edge meanwhile makes `exists` honest (the link is present, just not by
+    // this call), so compensation still correctly treats it as not-created.
+    let edge_cypher = format!(
+        "MATCH (a:{from_label} {{id: '{from_id}'}})-[r:{rel_type}]->(b:{to_label} {{id: '{to_id}'}}) \
+         RETURN count(*) AS edge"
+    );
+    match graph.query_rows(edge_cypher).await {
+        Ok(rs) if row_count(&rs) > 0 => "OK: exists".to_string(),
+        Ok(_) => "ERROR: relation endpoints not found".to_string(),
         Err(e) => format!("ERROR: {e}"),
     }
+}
+
+/// Extract the first cell of the first row as an i64 (a `count(*)` result),
+/// defaulting to 0 for an empty result.
+fn row_count(rs: &crate::graph::RowSet) -> i64 {
+    rs.rows
+        .first()
+        .and_then(|r| r.first())
+        .map(|c| c.as_i64())
+        .unwrap_or(0)
 }
 
 /// Handle a single client connection.
@@ -846,9 +875,9 @@ mod tests {
             .unwrap();
 
         let resp = persist_relation(&graph, &file_part_of("f1", "p1")).await;
-        assert_eq!(resp, "OK", "linking two existing nodes must succeed");
+        assert_eq!(resp, "OK: created", "the first link creates the edge");
 
-        // The edge is actually present.
+        // The edge is actually present, exactly once.
         let rows = graph
             .query_rows(
                 "MATCH (:File {id: 'f1'})-[:FILE_PART_OF]->(:Project {id: 'p1'}) RETURN count(*) AS n"
@@ -857,6 +886,19 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.rows[0][0].as_i64(), 1, "the FILE_PART_OF edge exists");
+
+        // A second create is an idempotent no-op reported as `exists`, and does
+        // not duplicate the edge (the conditional create is strict).
+        let again = persist_relation(&graph, &file_part_of("f1", "p1")).await;
+        assert_eq!(again, "OK: exists", "a repeat link reports exists, not created");
+        let rows = graph
+            .query_rows(
+                "MATCH (:File {id: 'f1'})-[:FILE_PART_OF]->(:Project {id: 'p1'}) RETURN count(*) AS n"
+                    .into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.rows[0][0].as_i64(), 1, "no duplicate edge after a repeat");
     }
 
     const VALID_REL_BODY: &str = r#"{"op":"create_relation","from_type":"system.File","from_id":"f1","to_type":"system.Project","to_id":"p1","relation_type":"FILE_PART_OF"}"#;
