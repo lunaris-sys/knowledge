@@ -13,7 +13,10 @@ use super::{SchemaError, SchemaFile, SchemaValidator};
 /// Default schema directory.
 const DEFAULT_SCHEMA_DIR: &str = "/var/lib/lunaris/schemas";
 
-/// System entity types compiled into the Graph Daemon.
+/// System entity types compiled into the Graph Daemon. These must match the
+/// node tables `graph.rs` creates, so a relation between them validates.
+/// (Single-sourcing this list and the relation allowlist with `graph.rs`'s
+/// table creation is the robust fix against drift; tracked as a follow-up.)
 fn system_entity_types() -> Vec<String> {
     vec![
         "system.File".into(),
@@ -23,6 +26,9 @@ fn system_entity_types() -> Vec<String> {
         "system.UserAction".into(),
         "system.Summary".into(),
         "system.Project".into(),
+        "system.Directory".into(),
+        "system.Annotation".into(),
+        "system.PinnedMarker".into(),
     ]
 }
 
