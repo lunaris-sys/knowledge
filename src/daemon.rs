@@ -33,7 +33,7 @@ use crate::proto::Event;
 use crate::quota::{AppTier, QuotaConfig, RateLimiter};
 use crate::schema::SchemaRegistry;
 use crate::utils::escape_cypher;
-use crate::write::{create_relation, RelationResult};
+use crate::write::{create_relation, retract_relation, RelationResult};
 
 /// Producer socket default (overridable via `LUNARIS_PRODUCER_SOCKET`).
 const DEFAULT_PRODUCER_SOCKET: &str = "/run/lunaris/event-bus-producer.sock";
@@ -314,11 +314,13 @@ struct WritePeer {
 /// write-mode prefix, beside the legacy raw-Cypher text query and the `0x01`
 /// typed-rows query). The body is JSON, tagged by `op`.
 ///
-/// The boundary is deliberately narrow: the only op is creating a built-in
-/// graph relation between two existing nodes. There is no free-form Cypher
-/// write path. The agent's executor is the only intended caller, and the
-/// authorisation primitive (`create_relation`) refuses anything outside the
-/// declared relation allowlist regardless of what is sent.
+/// The boundary is deliberately narrow: the only ops are creating a built-in
+/// graph relation between two existing nodes, and retracting (compensating) a
+/// relation the caller previously created, keyed by its operation id. There is
+/// no free-form Cypher write path. The agent's executor is the only intended
+/// caller, and the authorisation primitives (`create_relation` /
+/// `retract_relation`) refuse anything outside the declared relation allowlist
+/// regardless of what is sent.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 enum WriteRequest {
@@ -336,6 +338,18 @@ enum WriteRequest {
         /// id is not persisted (the edge's `op_id` stays NULL, as for the
         /// promotion pipeline). Only `FILE_PART_OF` carries the column today.
         #[serde(default)]
+        op_id: String,
+    },
+    /// Retract (compensate) a relation the caller previously created, deleting
+    /// only the edge that carries this exact `op_id`. The `op_id` is mandatory
+    /// and non-empty: a retract is always a precise undo of the caller's own
+    /// write, never a bare-edge delete. Idempotent (a no-match is success).
+    RetractRelation {
+        from_type: String,
+        from_id: String,
+        to_type: String,
+        to_id: String,
+        relation_type: String,
         op_id: String,
     },
 }
@@ -422,6 +436,29 @@ async fn handle_write_request(
                 Err(e) => return format!("ERROR: {e}"),
             };
             persist_relation(graph, &rel, &op_id).await
+        }
+        WriteRequest::RetractRelation {
+            from_type,
+            from_id,
+            to_type,
+            to_id,
+            relation_type,
+            op_id,
+        } => {
+            let rel = match retract_relation(
+                registry,
+                &from_type,
+                &from_id,
+                &to_type,
+                &to_id,
+                &relation_type,
+                &op_id,
+                &token,
+            ) {
+                Ok(r) => r,
+                Err(e) => return format!("ERROR: {e}"),
+            };
+            persist_retract(graph, &rel, &op_id).await
         }
     }
 }
@@ -518,6 +555,62 @@ async fn persist_relation(graph: &GraphHandle, rel: &RelationResult, op_id: &str
     match graph.query_rows(edge_cypher).await {
         Ok(rs) if row_count(&rs) > 0 => "OK: exists".to_string(),
         Ok(_) => "ERROR: relation endpoints not found".to_string(),
+        Err(e) => format!("ERROR: {e}"),
+    }
+}
+
+/// Persist an authorised relation *retract* (compensation): delete the single
+/// edge that carries this `op_id`, and only that edge.
+///
+/// The match is keyed by the `op_id` property, so this deletes exactly the edge
+/// the caller's own create stamped, never a bare edge it did not write. Only
+/// `FILE_PART_OF` carries the `op_id` column, so a retract of any other relation
+/// is refused fail-closed (there is no precise key, and we never delete an
+/// op-id-less edge here). The `op_id` non-emptiness was already enforced by
+/// `retract_relation`; it is re-checked and length-bounded here before it goes
+/// into the literal, mirroring `persist_relation`.
+///
+/// Deletion is **idempotent**: a match-nothing run (the edge was already gone,
+/// or never existed) is `OK: absent`, a successful no-op. A run that deleted the
+/// edge is `OK: retracted`. The two differ only in their label; both guarantee
+/// the same post-state (no edge with this op_id), which is what compensation
+/// needs. The single statement runs on the serial graph thread, so a concurrent
+/// retract of the same edge cannot double-delete: the second sees nothing and
+/// reports `absent`.
+async fn persist_retract(graph: &GraphHandle, rel: &RelationResult, op_id: &str) -> String {
+    if op_id.is_empty() {
+        return "ERROR: retract requires an op_id".to_string();
+    }
+    if op_id.len() > MAX_OP_ID_LEN {
+        return "ERROR: op_id too long".to_string();
+    }
+    let rel_type = &rel.relation_type;
+    // Only relations that carry the `op_id` column can be precisely retracted.
+    // Anything else has no per-operation key, so deleting it would be a
+    // bare-edge delete; refuse it rather than risk removing an untracked edge.
+    if rel_type != "FILE_PART_OF" {
+        return "ERROR: relation does not support op-id retract".to_string();
+    }
+    let from_label = rel
+        .from_type
+        .strip_prefix("system.")
+        .unwrap_or(&rel.from_type);
+    let to_label = rel.to_type.strip_prefix("system.").unwrap_or(&rel.to_type);
+    let from_id = escape_cypher(&rel.from_id);
+    let to_id = escape_cypher(&rel.to_id);
+    let op = escape_cypher(op_id);
+
+    // Endpoint labels and the relation type are validated identifiers (not
+    // attacker-controlled); only the ids and op_id are caller-supplied and are
+    // escaped into the literals. `deleted` counts the edges this statement
+    // matched and removed (RETURN runs over the same bound rows as DELETE).
+    let cypher = format!(
+        "MATCH (a:{from_label} {{id: '{from_id}'}})-[r:{rel_type} {{op_id: '{op}'}}]->(b:{to_label} {{id: '{to_id}'}}) \
+         DELETE r RETURN count(*) AS deleted"
+    );
+    match graph.query_rows(cypher).await {
+        Ok(rs) if row_count(&rs) > 0 => "OK: retracted".to_string(),
+        Ok(_) => "OK: absent".to_string(),
         Err(e) => format!("ERROR: {e}"),
     }
 }
@@ -971,6 +1064,66 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.rows[0][0].as_i64(), 1, "no duplicate edge after a repeat");
+    }
+
+    #[tokio::test]
+    async fn persist_retract_deletes_only_the_op_id_edge() {
+        let (graph, _tmp) = spawn_test_graph().await;
+        graph
+            .write("CREATE (f:File {id: 'f1', path: '/x', app_id: 'test', last_accessed: 0})".into())
+            .await
+            .unwrap();
+        graph
+            .write("CREATE (p:Project {id: 'p1'})".into())
+            .await
+            .unwrap();
+
+        // Create the edge under op-1.
+        assert_eq!(persist_relation(&graph, &file_part_of("f1", "p1"), "op-1").await, "OK: created");
+
+        // A retract under a *different* op_id matches nothing: the edge is the
+        // caller's own only when the op_id matches, so this is an idempotent
+        // no-op and the edge survives.
+        let miss = persist_retract(&graph, &file_part_of("f1", "p1"), "op-other").await;
+        assert_eq!(miss, "OK: absent", "a non-matching op_id retracts nothing");
+        let rows = graph
+            .query_rows(
+                "MATCH (:File {id: 'f1'})-[:FILE_PART_OF]->(:Project {id: 'p1'}) RETURN count(*) AS n".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.rows[0][0].as_i64(), 1, "the edge survives a wrong-op retract");
+
+        // The matching op_id deletes exactly that edge.
+        let hit = persist_retract(&graph, &file_part_of("f1", "p1"), "op-1").await;
+        assert_eq!(hit, "OK: retracted", "the owning op_id retracts its edge");
+        let rows = graph
+            .query_rows(
+                "MATCH (:File {id: 'f1'})-[:FILE_PART_OF]->(:Project {id: 'p1'}) RETURN count(*) AS n".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.rows[0][0].as_i64(), 0, "the edge is gone after its retract");
+
+        // Retracting again is an idempotent success (the edge is already gone).
+        let again = persist_retract(&graph, &file_part_of("f1", "p1"), "op-1").await;
+        assert_eq!(again, "OK: absent", "a repeat retract is an idempotent no-op");
+    }
+
+    #[tokio::test]
+    async fn persist_retract_refuses_a_relation_without_op_id_column() {
+        let (graph, _tmp) = spawn_test_graph().await;
+        // ACCESSED_BY carries no op_id column, so it has no precise per-operation
+        // key; a retract of it must be refused rather than risk a bare delete.
+        let rel = RelationResult {
+            from_type: "system.File".into(),
+            from_id: "f1".into(),
+            to_type: "system.App".into(),
+            to_id: "a1".into(),
+            relation_type: "ACCESSED_BY".into(),
+        };
+        let resp = persist_retract(&graph, &rel, "op-1").await;
+        assert_eq!(resp, "ERROR: relation does not support op-id retract");
     }
 
     const VALID_REL_BODY: &str = r#"{"op":"create_relation","from_type":"system.File","from_id":"f1","to_type":"system.Project","to_id":"p1","relation_type":"FILE_PART_OF"}"#;

@@ -36,6 +36,11 @@ pub enum CreateError {
     /// A relation endpoint has an empty id; a relation needs two concrete nodes.
     #[error("a relation endpoint id is empty")]
     EmptyEndpointId,
+    /// A retract was requested without an operation id. A retract is only ever a
+    /// precise, op-id-keyed undo of the caller's own write; an empty op_id would
+    /// degenerate into deleting a bare edge, which is never authorised.
+    #[error("a relation retract has an empty op_id")]
+    EmptyOpId,
     /// A relation whose endpoints are both outside the caller's namespace (e.g.
     /// linking two system nodes the caller does not own) needs a privileged
     /// `InstanceScope::All` token. A type-level relation scope alone must not let
@@ -166,6 +171,72 @@ pub struct RelationResult {
 /// nothing — never report success for a no-op against absent nodes. The
 /// returned [`RelationResult`] is exactly what to persist under that contract.
 pub fn create_relation(
+    registry: &SchemaRegistry,
+    from_type: &str,
+    from_id: &str,
+    to_type: &str,
+    to_id: &str,
+    relation_type: &str,
+    token: &CapabilityToken,
+) -> Result<RelationResult, CreateError> {
+    authorise_relation(
+        registry,
+        from_type,
+        from_id,
+        to_type,
+        to_id,
+        relation_type,
+        token,
+    )
+}
+
+/// Authorise and validate a relation *retract* (the compensation of a prior
+/// create), keyed by the operation id that the create stamped on the edge.
+///
+/// Authorisation mirrors [`create_relation`] exactly (same relation scope,
+/// anchor/privilege, declared-relation, known-type, and concrete-id checks),
+/// with one added, load-bearing constraint: a retract is **always keyed by a
+/// non-empty `op_id`**. The persistence layer MUST delete only an edge whose
+/// `op_id` property equals this value, so a caller can compensate only the
+/// precise edge *it* wrote (its own op_id is on that edge) and never a bare
+/// edge it did not create, another component's edge, or an untracked edge from
+/// the promotion pipeline (which carries no op_id). That scoping is what makes
+/// the create grant sufficient to authorise the matching undo without widening
+/// it into a general delete capability.
+///
+/// Deletion is idempotent: persisting a retract that matches no edge (already
+/// gone, or never existed) is a successful no-op, not an error. The returned
+/// [`RelationResult`] is exactly what to persist under that contract.
+pub fn retract_relation(
+    registry: &SchemaRegistry,
+    from_type: &str,
+    from_id: &str,
+    to_type: &str,
+    to_id: &str,
+    relation_type: &str,
+    op_id: &str,
+    token: &CapabilityToken,
+) -> Result<RelationResult, CreateError> {
+    // A retract is only ever a precise, op-id-keyed undo of the caller's own
+    // write. An empty op_id would degenerate into a bare-edge delete, which this
+    // primitive must never authorise.
+    if op_id.is_empty() {
+        return Err(CreateError::EmptyOpId);
+    }
+    authorise_relation(
+        registry,
+        from_type,
+        from_id,
+        to_type,
+        to_id,
+        relation_type,
+        token,
+    )
+}
+
+/// The shared, layered, fail-closed authorisation for a relation write (create
+/// or retract). See [`create_relation`] for the contract each step enforces.
+fn authorise_relation(
     registry: &SchemaRegistry,
     from_type: &str,
     from_id: &str,
@@ -528,6 +599,69 @@ default = 1.0
         assert!(matches!(
             create_relation(&reg, "system.File", "", "system.Project", "p1", "FILE_PART_OF", &token),
             Err(CreateError::EmptyEndpointId)
+        ));
+    }
+
+    #[test]
+    fn test_retract_relation_success() {
+        let (reg, _) = setup();
+        let token = relation_token();
+        let result = retract_relation(
+            &reg,
+            "system.File",
+            "f1",
+            "system.Project",
+            "p1",
+            "FILE_PART_OF",
+            "op-1",
+            &token,
+        )
+        .unwrap();
+        assert_eq!(result.from_id, "f1");
+        assert_eq!(result.to_id, "p1");
+        assert_eq!(result.relation_type, "FILE_PART_OF");
+    }
+
+    #[test]
+    fn test_retract_relation_requires_op_id() {
+        let (reg, _) = setup();
+        let token = relation_token();
+        // An empty op_id must be refused before any other check: a retract is
+        // only ever a precise, op-id-keyed undo, never a bare-edge delete.
+        assert!(matches!(
+            retract_relation(&reg, "system.File", "f1", "system.Project", "p1", "FILE_PART_OF", "", &token),
+            Err(CreateError::EmptyOpId)
+        ));
+    }
+
+    #[test]
+    fn test_retract_relation_reuses_create_authorisation() {
+        let (reg, _) = setup();
+        // The retract shares the create authorisation: an ungranted relation is
+        // denied even with a valid op_id, so a retract cannot reach an edge the
+        // caller was never allowed to write.
+        let token =
+            CapabilityToken::new("org.lunaris.agent".into(), 1, vec![], vec![], vec![], InstanceScope::All);
+        assert!(matches!(
+            retract_relation(&reg, "system.File", "f1", "system.Project", "p1", "FILE_PART_OF", "op-1", &token),
+            Err(CreateError::RelationDenied { .. })
+        ));
+        // And a declared scope for a non-built-in relation is still refused.
+        let token = CapabilityToken::new(
+            "org.lunaris.agent".into(),
+            1,
+            vec![],
+            vec![],
+            vec![RelationScope {
+                from: "system.File".into(),
+                to: "system.Project".into(),
+                relation_type: "BOGUS_REL".into(),
+            }],
+            InstanceScope::All,
+        );
+        assert!(matches!(
+            retract_relation(&reg, "system.File", "f1", "system.Project", "p1", "BOGUS_REL", "op-1", &token),
+            Err(CreateError::UndeclaredRelation { .. })
         ));
     }
 }
