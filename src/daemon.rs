@@ -771,13 +771,26 @@ async fn handle_client(
 /// read whose identifier collides with a keyword is refused, never a write
 /// let through), which is the safe direction for a read-only socket.
 ///
-/// This is a lexical guard, not a parser; the robust form is read-only
-/// enforcement in the graph engine (a read-only connection/transaction), a
-/// follow-up that would protect both this and the text query path at the
-/// execution layer rather than by inspecting the query text.
+/// The blocklist covers not only the graph-mutation clauses but the
+/// data-definition, attach, copy, and extension verbs, because on this socket
+/// those are the dangerous ones: `LOAD EXTENSION`/`INSTALL` run native code,
+/// `COPY` does filesystem I/O, `ATTACH`/`USE` reach another database, and
+/// `ALTER`/`EXPORT`/`IMPORT` change or dump the schema/data. None appear in the
+/// agent's read queries (`MATCH`/`WHERE`/`WITH`/`RETURN`/`ORDER`/`LIMIT`).
+///
+/// This is a lexical guard, not a parser. Engine-level read-only enforcement
+/// (a read-only `lbug` connection for the read path) was investigated and is
+/// NOT viable with the current engine: a read-only `Database` handle is a
+/// snapshot at open time and does not observe writes committed through the
+/// read-write handle, so the agent would read stale data (its own writes
+/// invisible), and opening a fresh handle per query is far too costly. Until
+/// the engine exposes a per-statement / per-transaction read-only flag, this
+/// expanded blocklist is the ceiling; it closes the known privilege-escalation
+/// verbs while keeping the over-reject-not-under-reject safety direction.
 fn is_write_query(cypher: &str) -> bool {
-    const WRITE_KEYWORDS: [&str; 7] = [
-        "CREATE", "MERGE", "DELETE", "SET", "REMOVE", "DROP", "DETACH",
+    const WRITE_KEYWORDS: [&str; 15] = [
+        "CREATE", "MERGE", "DELETE", "SET", "REMOVE", "DROP", "DETACH", "ALTER",
+        "ATTACH", "USE", "COPY", "LOAD", "INSTALL", "EXPORT", "IMPORT",
     ];
     let mut in_string = false;
     let mut escaped = false;
@@ -830,12 +843,29 @@ mod tests {
     }
 
     #[test]
+    fn rejects_dangerous_non_mutation_verbs() {
+        // Code execution, file I/O, cross-database, and schema/dump verbs are
+        // refused on the read socket even though they are not graph mutations.
+        assert!(is_write_query("LOAD EXTENSION 'evil.so'"));
+        assert!(is_write_query("INSTALL httpfs"));
+        assert!(is_write_query("COPY File TO '/tmp/exfil.csv'"));
+        assert!(is_write_query("ATTACH '/other/db' AS x (dbtype kuzu)"));
+        assert!(is_write_query("ALTER TABLE File ADD col STRING"));
+        assert!(is_write_query("USE other_db"));
+        assert!(is_write_query("EXPORT DATABASE '/tmp/dump'"));
+        assert!(is_write_query("IMPORT DATABASE '/tmp/dump'"));
+    }
+
+    #[test]
     fn allows_read_queries() {
         assert!(!is_write_query("MATCH (n:File) RETURN n"));
         assert!(!is_write_query("MATCH (a:App) WHERE a.id = 'x' RETURN a.name"));
-        // A write keyword inside a string literal is a value, not a clause.
+        // A write/admin keyword inside a string literal is a value, not a clause.
         assert!(!is_write_query(
             "MATCH (f:File) WHERE f.path = '/home/tim/DELETE/x' RETURN f.id"
+        ));
+        assert!(!is_write_query(
+            "MATCH (f:File) WHERE f.path = '/var/COPY/load' RETURN f.id"
         ));
     }
 
