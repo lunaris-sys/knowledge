@@ -42,6 +42,10 @@ const DEFAULT_PRODUCER_SOCKET: &str = "/run/lunaris/event-bus-producer.sock";
 /// query flood does not hammer the Event Bus producer.
 const EMIT_THROTTLE: Duration = Duration::from_secs(5);
 
+/// Upper bound on a write request's `op_id` (the agent's operation digest is a
+/// fixed-length hex string; this bounds an abusive caller's literal).
+const MAX_OP_ID_LEN: usize = 128;
+
 /// Per-identity rate-limit state shared across all query connections,
 /// so a caller's many connections share one token bucket (per
 /// *identity*, not per connection).
@@ -326,6 +330,13 @@ enum WriteRequest {
         to_type: String,
         to_id: String,
         relation_type: String,
+        /// Durable operation identity: the caller's stable id for this logical
+        /// write, persisted on the edge so a lost-response retry can reconcile
+        /// by asking whether *this* operation's edge exists. Optional; an empty
+        /// id is not persisted (the edge's `op_id` stays NULL, as for the
+        /// promotion pipeline). Only `FILE_PART_OF` carries the column today.
+        #[serde(default)]
+        op_id: String,
     },
 }
 
@@ -396,6 +407,7 @@ async fn handle_write_request(
             to_type,
             to_id,
             relation_type,
+            op_id,
         } => {
             let rel = match create_relation(
                 registry,
@@ -409,7 +421,7 @@ async fn handle_write_request(
                 Ok(r) => r,
                 Err(e) => return format!("ERROR: {e}"),
             };
-            persist_relation(graph, &rel).await
+            persist_relation(graph, &rel, &op_id).await
         }
     }
 }
@@ -433,12 +445,10 @@ async fn handle_write_request(
 ///
 /// The signal is per-*statement*, not per logical operation: if a create commits
 /// but its response is lost and the call is retried, the retry sees the edge and
-/// reports `exists`. So this is NOT a durable record of which logical operation
-/// created the edge. A compensator that must survive at-least-once retries needs
-/// durable operation identity (an idempotency key persisted with the edge), the
-/// deferred executor-design follow-up; today the agent's executor re-validates
-/// before each write, so a fresh retry whose edge now exists fails its
-/// `Not(EdgeExists)` proof and writes nothing, the interim guard.
+/// reports `exists`. Which logical *operation* created the edge is recorded
+/// separately by the `op_id` set on the edge (see below): a caller that loses
+/// the response reconciles by reading whether *its* `op_id` edge exists, a
+/// causally-tied verdict the bare `created`/`exists` flag cannot give.
 ///
 /// Row-level ownership/visibility on the matched endpoints is intentionally not
 /// enforced here. The authorisation gate in `create_relation` already requires a
@@ -448,7 +458,7 @@ async fn handle_write_request(
 /// filters becomes load-bearing when an unprivileged app links its own
 /// (anchored) nodes; that is the documented follow-up alongside app-relation
 /// support.
-async fn persist_relation(graph: &GraphHandle, rel: &RelationResult) -> String {
+async fn persist_relation(graph: &GraphHandle, rel: &RelationResult, op_id: &str) -> String {
     let from_label = rel
         .from_type
         .strip_prefix("system.")
@@ -457,6 +467,21 @@ async fn persist_relation(graph: &GraphHandle, rel: &RelationResult) -> String {
     let rel_type = &rel.relation_type;
     let from_id = escape_cypher(&rel.from_id);
     let to_id = escape_cypher(&rel.to_id);
+
+    // Durable operation identity (idempotency key): persisted on the edge so a
+    // lost-response retry can reconcile by reading whether *this* op's edge
+    // exists. Only `FILE_PART_OF` carries the `op_id` column today, so it is set
+    // only there; a missing/empty id leaves it NULL (as the promotion pipeline's
+    // own creates do). The caller-supplied id is bounded and escaped into the
+    // literal (it is untrusted; the agent derives a fixed-length digest).
+    if op_id.len() > MAX_OP_ID_LEN {
+        return "ERROR: op_id too long".to_string();
+    }
+    let op_clause = if rel_type == "FILE_PART_OF" && !op_id.is_empty() {
+        format!(" {{op_id: '{}'}}", escape_cypher(op_id))
+    } else {
+        String::new()
+    };
 
     // Atomic conditional create. `created` = 1 only if this statement created
     // the edge; 0 if the edge already existed (the `WHERE r IS NULL` filters its
@@ -467,7 +492,7 @@ async fn persist_relation(graph: &GraphHandle, rel: &RelationResult) -> String {
     let create_cypher = format!(
         "MATCH (a:{from_label} {{id: '{from_id}'}}), (b:{to_label} {{id: '{to_id}'}}) \
          OPTIONAL MATCH (a)-[r:{rel_type}]->(b) WITH a, b, r WHERE r IS NULL \
-         CREATE (a)-[:{rel_type}]->(b) RETURN count(*) AS created"
+         CREATE (a)-[:{rel_type}{op_clause}]->(b) RETURN count(*) AS created"
     );
     let created = match graph.query_rows(create_cypher).await {
         Ok(rs) => row_count(&rs),
@@ -874,7 +899,7 @@ mod tests {
             .await
             .unwrap();
 
-        let resp = persist_relation(&graph, &file_part_of("f1", "p1")).await;
+        let resp = persist_relation(&graph, &file_part_of("f1", "p1"), "op-1").await;
         assert_eq!(resp, "OK: created", "the first link creates the edge");
 
         // The edge is actually present, exactly once.
@@ -887,9 +912,26 @@ mod tests {
             .unwrap();
         assert_eq!(rows.rows[0][0].as_i64(), 1, "the FILE_PART_OF edge exists");
 
+        // The op_id is persisted, so a reconciliation by op_id finds THIS
+        // operation's edge but not a different operation's.
+        let mine = graph
+            .query_rows(
+                "MATCH (:File {id: 'f1'})-[:FILE_PART_OF {op_id: 'op-1'}]->(:Project {id: 'p1'}) RETURN count(*) AS n".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(mine.rows[0][0].as_i64(), 1, "op-1 reconciles to its own edge");
+        let other = graph
+            .query_rows(
+                "MATCH (:File {id: 'f1'})-[:FILE_PART_OF {op_id: 'op-other'}]->(:Project {id: 'p1'}) RETURN count(*) AS n".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(other.rows[0][0].as_i64(), 0, "a different op does not match");
+
         // A second create is an idempotent no-op reported as `exists`, and does
         // not duplicate the edge (the conditional create is strict).
-        let again = persist_relation(&graph, &file_part_of("f1", "p1")).await;
+        let again = persist_relation(&graph, &file_part_of("f1", "p1"), "op-2").await;
         assert_eq!(again, "OK: exists", "a repeat link reports exists, not created");
         let rows = graph
             .query_rows(
@@ -960,7 +1002,7 @@ mod tests {
             .unwrap();
         // No Project node exists, so the MATCH binds nothing and the checked
         // persistence must report not-found rather than a silent success.
-        let resp = persist_relation(&graph, &file_part_of("f1", "missing")).await;
+        let resp = persist_relation(&graph, &file_part_of("f1", "missing"), "").await;
         assert_eq!(resp, "ERROR: relation endpoints not found");
     }
 

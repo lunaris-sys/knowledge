@@ -496,8 +496,13 @@ fn create_schema(conn: &Connection) -> Result<()> {
     )
     .map_err(|e| anyhow!("create Directory table: {e}"))?;
 
+    // `op_id` records the agent operation that created an edge (durable
+    // operation identity), so a write whose response was lost can be reconciled
+    // by asking whether *this* operation's edge exists. Backward compatible: the
+    // promotion pipeline's own `FILE_PART_OF` creates omit it and it defaults to
+    // NULL, so only the agent's write socket sets it.
     conn.query(
-        "CREATE REL TABLE IF NOT EXISTS FILE_PART_OF(FROM File TO Project)",
+        "CREATE REL TABLE IF NOT EXISTS FILE_PART_OF(FROM File TO Project, op_id STRING)",
     )
     .map_err(|e| anyhow!("create FILE_PART_OF rel: {e}"))?;
 
