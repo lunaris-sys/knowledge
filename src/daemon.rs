@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use prost::Message;
+use serde::Deserialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
@@ -27,9 +28,12 @@ use tracing::{debug, error, info, warn};
 use crate::auth::Authenticator;
 use crate::events::{self, GraphEvent};
 use crate::graph::GraphHandle;
-use crate::identity::app_id_from_pid;
+use crate::identity::{app_id_from_pid, pid_start_time};
 use crate::proto::Event;
-use crate::quota::{QuotaConfig, RateLimiter};
+use crate::quota::{AppTier, QuotaConfig, RateLimiter};
+use crate::schema::SchemaRegistry;
+use crate::utils::escape_cypher;
+use crate::write::{create_relation, RelationResult};
 
 /// Producer socket default (overridable via `LUNARIS_PRODUCER_SOCKET`).
 const DEFAULT_PRODUCER_SOCKET: &str = "/run/lunaris/event-bus-producer.sock";
@@ -170,8 +174,15 @@ pub async fn listen(socket_path: &str, graph: GraphHandle) -> Result<()> {
     let rate = Arc::new(Mutex::new(RateState::new()));
     let emitter = Arc::new(RateLimitEmitter::new());
 
+    // Schema registry for write-mode relation validation. Built with the
+    // compiled-in system entity types only; that is sufficient for the agent's
+    // built-in system relations (the only write op today), since
+    // `create_relation` refuses anything outside the built-in allowlist anyway.
+    // Loading app-defined schemas for app-relation writes is a follow-up.
+    let registry = Arc::new(SchemaRegistry::new(vec![]));
+
     tokio::try_join!(
-        listen_queries(socket_path, graph, auth.clone(), rate, emitter),
+        listen_queries(socket_path, graph, auth.clone(), rate, emitter, registry),
         listen_events(auth),
     )?;
 
@@ -185,6 +196,7 @@ async fn listen_queries(
     auth: Arc<Mutex<Authenticator>>,
     rate: Arc<Mutex<RateState>>,
     emitter: Arc<RateLimitEmitter>,
+    registry: Arc<SchemaRegistry>,
 ) -> Result<()> {
     if Path::new(socket_path).exists() {
         std::fs::remove_file(socket_path)?;
@@ -206,9 +218,10 @@ async fn listen_queries(
                 let auth = auth.clone();
                 let rate = rate.clone();
                 let emitter = emitter.clone();
+                let registry = registry.clone();
                 tokio::spawn(async move {
                     if let Err(e) =
-                        handle_client(stream, graph, auth, rate, emitter, our_uid).await
+                        handle_client(stream, graph, auth, rate, emitter, registry, our_uid).await
                     {
                         error!("graph daemon client error: {e}");
                     }
@@ -281,6 +294,190 @@ async fn handle_graph_event(auth: &Arc<Mutex<Authenticator>>, event: GraphEvent)
     }
 }
 
+/// The kernel-attested write peer: the SO_PEERCRED pid plus that pid's start
+/// time captured at connection. The start time is the PID-reuse guard (E7): a
+/// write re-reads it and refuses if it changed, so a recycled pid (the original
+/// peer exited and the number was reused by another process) cannot borrow the
+/// connection's authority. `start_time` is `None` only if it could not be read
+/// at connection, in which case a write fails closed (reuse is unguardable).
+#[derive(Clone, Copy)]
+struct WritePeer {
+    pid: u32,
+    start_time: Option<u64>,
+}
+
+/// A structured graph write request, sent with a leading `0x02` byte (the
+/// write-mode prefix, beside the legacy raw-Cypher text query and the `0x01`
+/// typed-rows query). The body is JSON, tagged by `op`.
+///
+/// The boundary is deliberately narrow: the only op is creating a built-in
+/// graph relation between two existing nodes. There is no free-form Cypher
+/// write path. The agent's executor is the only intended caller, and the
+/// authorisation primitive (`create_relation`) refuses anything outside the
+/// declared relation allowlist regardless of what is sent.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+enum WriteRequest {
+    /// Create `from -[relation_type]-> to` between two existing nodes,
+    /// identified by their namespaced entity type and concrete id.
+    CreateRelation {
+        from_type: String,
+        from_id: String,
+        to_type: String,
+        to_id: String,
+        relation_type: String,
+    },
+}
+
+/// Authorise and persist a structured write request, returning the plaintext
+/// response (`OK` / `ERROR: ...`).
+///
+/// Fail-closed at every layer: the request must come from a live, non-recycled
+/// peer process (PID-reuse guard) whose permission profile grants the relation
+/// (token issuance), the relation must pass `create_relation` (scope +
+/// anchor/privilege + declared + known types), and persistence is a *checked*
+/// MATCH/MERGE that reports not-found when an endpoint instance is absent rather
+/// than a silent no-op success.
+///
+/// SECURITY BOUNDARY (same-uid): the peer's identity comes from
+/// `app_id_from_pid`, and both it and the permission profile under
+/// `~/.config/permissions/` are user-writable. A same-uid process can therefore
+/// squat a privileged app id and grant itself the relation scope, so this write
+/// mode does not defend against a same-uid attacker. That is the documented F3
+/// gap shared across the daemon (the read rate-limiter, the audit daemon's
+/// ingest admission), closed only by the installd inode-keyed identity registry
+/// and root-owned profiles (`docs/architecture/identity-spoof-mitigation.md`).
+/// It is *sharper* here than on the read path because this authorises a graph
+/// mutation, so enabling this socket for real first-party-only use is gated on
+/// that hardening (canonical-executable provenance as the interim step); a hard
+/// path gate is not applied now because the agent runs from a dev tree during
+/// development. Cross-uid peers are already rejected at connection.
+async fn handle_write_request(
+    body: &[u8],
+    peer: Option<WritePeer>,
+    registry: &SchemaRegistry,
+    graph: &GraphHandle,
+    auth: &Arc<Mutex<Authenticator>>,
+) -> String {
+    let req: WriteRequest = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => return format!("ERROR: malformed write request: {e}"),
+    };
+
+    // A write must be attributable to a live peer process.
+    let Some(peer) = peer else {
+        return "ERROR: write requires a resolvable peer process".to_string();
+    };
+
+    // PID-reuse guard (E7): the pid's start time must be readable now and match
+    // the value captured at connection. If it changed, the original peer exited
+    // and another process inherited the pid number, so it must not borrow this
+    // connection's write authority. Re-checked immediately before token
+    // issuance, which itself re-resolves the app_id from the same pid.
+    let Some(captured_start) = peer.start_time else {
+        return "ERROR: write requires a verifiable peer process".to_string();
+    };
+    match pid_start_time(peer.pid) {
+        Ok(now) if now == captured_start => {}
+        _ => return "ERROR: peer process changed since connection".to_string(),
+    }
+
+    // The token is issued from the pid's permission profile and fails closed if
+    // it has no graph access or no matching relation scope.
+    let token = match auth.lock().await.issue_token_for_pid(peer.pid) {
+        Ok(t) => t,
+        Err(e) => return format!("ERROR: {e}"),
+    };
+
+    match req {
+        WriteRequest::CreateRelation {
+            from_type,
+            from_id,
+            to_type,
+            to_id,
+            relation_type,
+        } => {
+            let rel = match create_relation(
+                registry,
+                &from_type,
+                &from_id,
+                &to_type,
+                &to_id,
+                &relation_type,
+                &token,
+            ) {
+                Ok(r) => r,
+                Err(e) => return format!("ERROR: {e}"),
+            };
+            persist_relation(graph, &rel).await
+        }
+    }
+}
+
+/// Persist an authorised relation with a *checked* MATCH/MERGE.
+///
+/// The endpoint types were validated as built-in system types, so their graph
+/// table name is the type minus the `system.` prefix and the relation label is
+/// a known identifier from the allowlist; none of those are attacker-controlled.
+/// Only the endpoint ids are caller-supplied, so they are escaped into the
+/// Cypher string literals. `RETURN count(*)` is 0 when a MATCH bound nothing (an
+/// absent endpoint), which is reported as not-found rather than a false success;
+/// the MATCH + MERGE + RETURN run as one statement, so there is no check/merge
+/// TOCTOU window.
+///
+/// Row-level ownership/visibility on the matched endpoints is intentionally not
+/// enforced here. The authorisation gate in `create_relation` already requires a
+/// privileged `InstanceScope::All` token for a relation between nodes the caller
+/// does not own, and the only write caller today is the agent, a first-party
+/// component curating the global graph. Enforcing per-row `_owner`/`_deleted`
+/// filters becomes load-bearing when an unprivileged app links its own
+/// (anchored) nodes; that is the documented follow-up alongside app-relation
+/// support.
+async fn persist_relation(graph: &GraphHandle, rel: &RelationResult) -> String {
+    let from_label = rel
+        .from_type
+        .strip_prefix("system.")
+        .unwrap_or(&rel.from_type);
+    let to_label = rel.to_type.strip_prefix("system.").unwrap_or(&rel.to_type);
+    let cypher = format!(
+        "MATCH (a:{from_label} {{id: '{from_id}'}}), (b:{to_label} {{id: '{to_id}'}}) \
+         MERGE (a)-[:{rel_type}]->(b) RETURN count(*) AS n",
+        from_label = from_label,
+        to_label = to_label,
+        rel_type = rel.relation_type,
+        from_id = escape_cypher(&rel.from_id),
+        to_id = escape_cypher(&rel.to_id),
+    );
+
+    // A write awaits its actual result, with no client-side timeout, so the
+    // response is definitive: `OK` means the edge is committed, an `ERROR`
+    // means it is not. The read path uses a 500 ms deadline to bound the
+    // client wait, but applying it here would be wrong for a mutation: the
+    // graph worker API is not cancellable, so a timeout would unblock the
+    // caller while the queued MERGE could still commit later, reporting
+    // failure for a write that succeeds. The operation is small (an indexed
+    // MATCH on two ids) and the per-identity write bucket bounds its
+    // frequency, so awaiting is safe. MERGE is idempotent, so a transport
+    // failure and retry is also safe: the second MERGE finds the edge and
+    // still reports `OK`.
+    match graph.query_rows(cypher).await {
+        Ok(rowset) => {
+            let count = rowset
+                .rows
+                .first()
+                .and_then(|r| r.first())
+                .map(|c| c.as_i64())
+                .unwrap_or(0);
+            if count > 0 {
+                "OK".to_string()
+            } else {
+                "ERROR: relation endpoints not found".to_string()
+            }
+        }
+        Err(e) => format!("ERROR: {e}"),
+    }
+}
+
 /// Handle a single client connection.
 ///
 /// Phase 3.2 adds token awareness, but for backward compatibility the
@@ -290,9 +487,10 @@ async fn handle_graph_event(auth: &Arc<Mutex<Authenticator>>, event: GraphEvent)
 async fn handle_client(
     mut stream: UnixStream,
     graph: GraphHandle,
-    _auth: Arc<Mutex<Authenticator>>,
+    auth: Arc<Mutex<Authenticator>>,
     rate: Arc<Mutex<RateState>>,
     emitter: Arc<RateLimitEmitter>,
+    registry: Arc<SchemaRegistry>,
     our_uid: u32,
 ) -> Result<()> {
     // Resolve the peer identity once at connection for per-identity
@@ -311,21 +509,27 @@ async fn handle_client(
     // (`docs/architecture/identity-spoof-mitigation.md`). A
     // provenance check (privileged tiers only from canonical /usr
     // paths) is the interim hardening when that lands.
-    let app_id = match so_peercred(stream.as_raw_fd()) {
+    // `peer` is the kernel-attested write peer (pid + start time), captured
+    // once for write-mode token issuance and the PID-reuse guard; `None` when
+    // it cannot be trusted, so a write fails closed.
+    let (app_id, peer) = match so_peercred(stream.as_raw_fd()) {
         Ok((pid, uid)) => {
             if uid != our_uid {
                 warn!(peer_uid = uid, "graph daemon: rejecting cross-uid client");
                 return Ok(());
             }
             if pid > 0 {
-                app_id_from_pid(pid as u32).unwrap_or_else(|_| "unknown".to_string())
+                let pid = pid as u32;
+                let id = app_id_from_pid(pid).unwrap_or_else(|_| "unknown".to_string());
+                let start_time = pid_start_time(pid).ok();
+                (id, Some(WritePeer { pid, start_time }))
             } else {
-                "unknown".to_string()
+                ("unknown".to_string(), None)
             }
         }
         Err(e) => {
             warn!("graph daemon: SO_PEERCRED failed ({e}); treating peer as untrusted");
-            "unknown".to_string()
+            ("unknown".to_string(), None)
         }
     };
     debug!(app_id = %app_id, "new graph daemon client");
@@ -348,11 +552,70 @@ async fn handle_client(
             return Ok(());
         }
 
-        // Read query string. A leading 0x01 byte selects the structured
-        // (typed JSON RowSet) response mode; without it the request is a
-        // legacy raw-Cypher text query, so existing clients are unaffected.
+        // Read the request body; its leading byte selects the mode.
         let mut buf = vec![0u8; len];
         stream.read_exact(&mut buf).await?;
+
+        // Write mode: a leading 0x02 byte selects a structured graph write
+        // request (JSON body) instead of a Cypher read query. It is rate-
+        // limited on the per-identity *write* bucket and authorised + persisted
+        // by `handle_write_request`; the read path below is untouched.
+        if buf.first() == Some(&0x02) {
+            let body = &buf[1..];
+
+            // Least-privilege dispatch gate: only first-party / system callers
+            // may mutate the graph; a ThirdParty (or unresolved `unknown`) peer
+            // is refused before any token work. This does not by itself defeat
+            // same-uid app_id spoofing (see `handle_write_request`), but it
+            // keeps the system-relation write path off-limits to ordinary apps.
+            let tier = QuotaConfig::lunaris_default().tier_for_app(&app_id);
+            if tier == AppTier::ThirdParty {
+                warn!(app_id = %app_id, "graph write refused for non-first-party caller");
+                let response = "ERROR: write mode not permitted for this caller";
+                let response_len = (response.len() as u32).to_be_bytes();
+                stream.write_all(&response_len).await?;
+                stream.write_all(response.as_bytes()).await?;
+                continue;
+            }
+
+            let violation = {
+                let mut rs = rate.lock().await;
+                match rs.limiter.check_write(&app_id) {
+                    Ok(()) => None,
+                    Err(e) => Some((e.to_string(), rs.should_emit(&app_id))),
+                }
+            };
+
+            let (response, emit_violation) = if let Some((reason, emit)) = violation {
+                warn!(app_id = %app_id, "graph write rate limit exceeded");
+                (format!("ERROR: RateLimited: {reason}"), emit)
+            } else {
+                (
+                    handle_write_request(body, peer, &registry, &graph, &auth).await,
+                    false,
+                )
+            };
+
+            if emit_violation {
+                let emitter = emitter.clone();
+                let app_id = app_id.clone();
+                tokio::task::spawn_blocking(move || emitter.emit(&app_id));
+            }
+
+            timing_noise().await;
+
+            let response_bytes = response.as_bytes();
+            let response_len = u32::try_from(response_bytes.len())
+                .expect("response too large")
+                .to_be_bytes();
+            stream.write_all(&response_len).await?;
+            stream.write_all(response_bytes).await?;
+            continue;
+        }
+
+        // Read mode. A leading 0x01 byte selects the structured (typed JSON
+        // RowSet) response; without it the request is a legacy raw-Cypher text
+        // query, so existing clients are unaffected.
         let typed_rows = buf.first() == Some(&0x01);
         let cypher_bytes = if typed_rows { &buf[1..] } else { &buf[..] };
         let cypher = String::from_utf8(cypher_bytes.to_vec())?;
@@ -548,6 +811,115 @@ mod tests {
         assert!(!rs.should_emit("com.test"), "a repeat within the window is throttled");
         // A different identity emits independently.
         assert!(rs.should_emit("com.other"));
+    }
+
+    /// Spawn a fresh graph in a temp dir and wait for schema init. These tests
+    /// touch a real Ladybug instance, so they flake under a parallel `cargo
+    /// test` (multi-instance); run the suite with `--test-threads=1`.
+    async fn spawn_test_graph() -> (GraphHandle, tempfile::TempDir) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let graph = crate::graph::spawn(tmp.path().join("graph").to_str().unwrap()).unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        (graph, tmp)
+    }
+
+    fn file_part_of(from_id: &str, to_id: &str) -> RelationResult {
+        RelationResult {
+            from_type: "system.File".into(),
+            from_id: from_id.into(),
+            to_type: "system.Project".into(),
+            to_id: to_id.into(),
+            relation_type: "FILE_PART_OF".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn persist_relation_links_existing_nodes() {
+        let (graph, _tmp) = spawn_test_graph().await;
+        graph
+            .write("CREATE (f:File {id: 'f1', path: '/x', app_id: 'test', last_accessed: 0})".into())
+            .await
+            .unwrap();
+        graph
+            .write("CREATE (p:Project {id: 'p1'})".into())
+            .await
+            .unwrap();
+
+        let resp = persist_relation(&graph, &file_part_of("f1", "p1")).await;
+        assert_eq!(resp, "OK", "linking two existing nodes must succeed");
+
+        // The edge is actually present.
+        let rows = graph
+            .query_rows(
+                "MATCH (:File {id: 'f1'})-[:FILE_PART_OF]->(:Project {id: 'p1'}) RETURN count(*) AS n"
+                    .into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.rows[0][0].as_i64(), 1, "the FILE_PART_OF edge exists");
+    }
+
+    const VALID_REL_BODY: &str = r#"{"op":"create_relation","from_type":"system.File","from_id":"f1","to_type":"system.Project","to_id":"p1","relation_type":"FILE_PART_OF"}"#;
+
+    #[tokio::test]
+    async fn write_rejects_recycled_pid() {
+        let (graph, _tmp) = spawn_test_graph().await;
+        let auth = Arc::new(Mutex::new(Authenticator::new()));
+        let registry = SchemaRegistry::new(vec![]);
+        // A start time that cannot match the live process: the reuse guard must
+        // fire before any token issuance or graph write.
+        let peer = WritePeer {
+            pid: std::process::id(),
+            start_time: Some(0),
+        };
+        let resp =
+            handle_write_request(VALID_REL_BODY.as_bytes(), Some(peer), &registry, &graph, &auth)
+                .await;
+        assert_eq!(resp, "ERROR: peer process changed since connection");
+    }
+
+    #[tokio::test]
+    async fn write_rejects_unverifiable_peer() {
+        let (graph, _tmp) = spawn_test_graph().await;
+        let auth = Arc::new(Mutex::new(Authenticator::new()));
+        let registry = SchemaRegistry::new(vec![]);
+        // No captured start time: reuse cannot be guarded, so fail closed.
+        let peer = WritePeer {
+            pid: std::process::id(),
+            start_time: None,
+        };
+        let resp =
+            handle_write_request(VALID_REL_BODY.as_bytes(), Some(peer), &registry, &graph, &auth)
+                .await;
+        assert_eq!(resp, "ERROR: write requires a verifiable peer process");
+    }
+
+    #[tokio::test]
+    async fn write_rejects_absent_peer_and_malformed_body() {
+        let (graph, _tmp) = spawn_test_graph().await;
+        let auth = Arc::new(Mutex::new(Authenticator::new()));
+        let registry = SchemaRegistry::new(vec![]);
+
+        let no_peer =
+            handle_write_request(VALID_REL_BODY.as_bytes(), None, &registry, &graph, &auth).await;
+        assert_eq!(no_peer, "ERROR: write requires a resolvable peer process");
+
+        // A malformed body is rejected before the peer is even consulted.
+        let bad = handle_write_request(b"not json", None, &registry, &graph, &auth).await;
+        assert!(bad.starts_with("ERROR: malformed write request"), "got: {bad}");
+    }
+
+    #[tokio::test]
+    async fn persist_relation_reports_absent_endpoint() {
+        let (graph, _tmp) = spawn_test_graph().await;
+        graph
+            .write("CREATE (f:File {id: 'f1', path: '/x', app_id: 'test', last_accessed: 0})".into())
+            .await
+            .unwrap();
+        // No Project node exists, so the MATCH binds nothing and the checked
+        // persistence must report not-found rather than a silent success.
+        let resp = persist_relation(&graph, &file_part_of("f1", "missing")).await;
+        assert_eq!(resp, "ERROR: relation endpoints not found");
     }
 
     #[test]
